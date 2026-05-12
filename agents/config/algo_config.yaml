@@ -1,0 +1,74 @@
+# File containing the optimal hyper-parameters configuration for each algorithm found after the hyper-parameter optimization process
+policy_kwargs:
+  net_arch: [128, 64]
+  activation_fn: LeakyReLU
+  optimizer_class: Adam
+  optimizer_kwargs:
+    eps: 0.0000001
+    weight_decay: 0.0001
+    amsgrad: False
+  lstm_hidden_size: 32
+  n_lstm_layers: 1
+
+idqn:
+  learning_rate_type: constant
+  learning_rate: 0.00001
+  buffer_size: 1000000
+  learning_starts: 1000
+  batch_size: 32
+  tau: 0.05
+  gamma: 0.95
+  train_freq: 4
+  gradient_steps: 1
+  optimize_memory_usage: False
+  n_steps: 5
+  target_update_interval: 10000
+  exploration_fraction: 0.5
+  exploration_initial_eps: 1.0
+  exploration_final_eps: 0.05
+  max_grad_norm: 5
+ppo:
+  n_steps: 2048
+  ent_coef: 0.01
+  vf_coef: 0.5
+  learning_rate: 0.001
+  learning_rate_type: constant
+  learning_rate_final: 0.00001
+  batch_size: 64
+  n_epochs: 20
+  gamma: 0.9
+  gae_lambda: 0.95
+  clip_range: 0.2
+  normalize_advantage: True
+  max_grad_norm: 0.5
+maskable_ppo:
+  n_steps: 2048
+  ent_coef: 0.01
+  vf_coef: 0.5
+  learning_rate: 0.001
+  learning_rate_type: constant
+  learning_rate_final: 0.00001
+  batch_size: 64
+  n_epochs: 20
+  gamma: 0.9
+  gae_lambda: 0.95
+  clip_range: 0.2
+  normalize_advantage: True
+  max_grad_norm: 0.5
+
+projection:
+  ppo:
+    n_steps: 2048
+    ent_coef: 0.01
+    vf_coef: 0.5
+    learning_rate: 0.0001
+    learning_rate_type: constant
+    learning_rate_final: 0.00001
+    batch_size: 128
+    n_epochs: 20
+    gamma: 0.95
+    gae_lambda: 0.95
+    clip_range: 0.2
+    normalize_advantage: True
+    max_grad_norm: 0.1
+

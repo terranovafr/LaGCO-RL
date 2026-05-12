@@ -1,0 +1,12 @@
+num_nodes:
+  type: 'int'
+  min: 10
+  max: 100
+  size_replacement: true
+  important: true
+  complexity: "max"
+
+max_weight:
+  type: 'int'
+  min: 10
+  max: 100

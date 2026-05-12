@@ -1,0 +1,60 @@
+# Algorithm specific hyperparameters ranges to explore during hyperopt
+ppo:
+  learning_rate:
+    type: "categorical"
+    values: [ 0.00001, 0.0001, 0.001 ]
+  batch_size:
+    type: "categorical"
+    values: [ 32, 64, 128 ]
+  gamma:
+    type: "categorical"
+    values: [ 0.9, 0.95, 0.99 ]
+  n_steps:
+    type: "categorical"
+    values: [ 512, 1024, 2048 ]
+  ent_coef:
+    type: "categorical"
+    values: [ 0.01, 0.1, 0.2 ]
+  max_grad_norm:
+    type: "categorical"
+    values: [ 0.1, 0.3, 0.5 ]
+
+maskable_ppo:
+  learning_rate:
+    type: "categorical"
+    values: [ 0.00001, 0.0001, 0.001 ]
+  batch_size:
+    type: "categorical"
+    values: [ 32, 64, 128 ]
+  gamma:
+    type: "categorical"
+    values: [ 0.9, 0.95, 0.99 ]
+  n_steps:
+    type: "categorical"
+    values: [ 512, 1024, 2048 ]
+  ent_coef:
+    type: "categorical"
+    values: [ 0.01, 0.1, 0.2 ]
+  max_grad_norm:
+    type: "categorical"
+    values: [ 0.1, 0.3, 0.5 ]
+
+idqn:
+  learning_rate:
+    type: "categorical"
+    values: [0.00001, 0.00005, 0.0001]
+  gamma:
+    type: "categorical"
+    values: [0.9, 0.95, 0.99]
+  batch_size:
+    type: "categorical"
+    values: [32, 64, 128]
+  n_steps:
+    type: "categorical"
+    values: [1, 3, 5]
+  target_update_interval:
+    type: "categorical"
+    values: [2000, 5000, 10000]
+  tau:
+    type: "categorical"
+    values: [0.01, 0.05, 0.1]

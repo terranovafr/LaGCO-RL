@@ -1,0 +1,71 @@
+default_model_config:
+  batch_size: 32
+  layers:
+  - NN_channels: 32
+    activation: 'null'
+    out_channels: 32
+    type: NNConv
+  - activation: 'null'
+    aggr: mean
+    normalize: true
+    out_channels: 32
+    type: SAGEConv
+  learning_rate: 0.01
+example_blocks:
+  GATConv:
+  - NN_channels: 32
+    activation: leakyrelu
+    out_channels: 64
+    type: NNConv
+  - act: leakyrelu
+    out_channels: 64
+    type: GATConv
+  - act: 'null'
+    out_channels: 32
+    type: GATConv
+  GCNConv:
+  - NN_channels: 32
+    activation: leakyrelu
+    out_channels: 64
+    type: NNConv
+  - activation: leakyrelu
+    out_channels: 64
+    type: GCNConv
+  - activation: 'null'
+    out_channels: 32
+    type: GCNConv
+  GINConv: &id001
+  - activation: leakyrelu
+    out_channels: 64
+    type: GINConv
+  - activation: leakyrelu
+    out_channels: 64
+    type: GINConv
+  - activation: null
+    out_channels: 32
+    type: GINConv
+  SAGEConv:
+  - NN_channels: 32
+    activation: leakyrelu
+    out_channels: 64
+    type: NNConv
+  - activation: leakyrelu
+    out_channels: 64
+    type: SAGEConv
+  - activation: 'null'
+    out_channels: 32
+    type: SAGEConv
+latent_dim_vgae: 32
+model_config:
+  batch_size: 32
+  layers:
+  - NN_channels: 16
+    activation: 'ReLU'
+    out_channels: 32
+    type: NNConv
+  - activation: 'null'
+    aggr: mean
+    normalize: true
+    out_channels: 16
+    type: SAGEConv
+  learning_rate: 0.01

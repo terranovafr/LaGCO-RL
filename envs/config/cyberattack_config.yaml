@@ -1,0 +1,29 @@
+fully_connected_graph: true # whether everyone should be neighbor of everyone (allowing larger discovery at reconnaissance)
+p_patch_scale_year: 0 # small probability of patching according to date
+invalid_action_penalty_sum: -10 # sum across episode to be divided by number of steps
+max_dos_percentage: 0 # max % of vulns with this outcome
+max_lateral_percentage: 0.4 # max % of vulns with this outcome
+outcome_selection: false # should the agent select the outcome in the action space (across VALID ones for the vulnerability?)
+outcome_selection_all: false # should the agent select the outcome in the action space (across ALL, even invalid ones)?
+remove_DOS_starter: true # remove DOS actions of starter node, hich may hinder episode
+remove_all_DOS: false # remove all DOS actions, obstacles for the agent
+
+goal: control # define reward to be used (only this defined for now)
+reward_models: # define weights and penalties for each outcome/condition
+  control:
+    no_enough_privileges: -1
+    detected_and_blocked: 0
+    credential_access: 20
+    lateral_movement: 20
+    reconnaissance: 3 # per node
+    discovery: 2
+    collection: 1
+    exfiltration: 1
+    DOS: -10
+    persistence: 1
+    defense_evasion: 2
+    privilege_escalation: 3
+
+
+
+

@@ -1,0 +1,51 @@
+num_nodes:
+    type: 'int'
+    min: 10
+    max: 30
+    important: true
+    complexity: "max"
+    size_replacement: true
+
+communication_edge_ratio:
+    type: 'float'
+    min: 0.1
+    max: 0.3
+    interval: 0.1
+    important: true
+    complexity: "max"
+
+non_zero_traffic_ratio:
+    type: 'float'
+    min: 0.1
+    max: 0.3
+    interval: 0.1
+    important: true
+    complexity: "max"
+
+min_capacity:
+    type: 'int'
+    min: 10
+    max: 100
+    complexity: "min"
+
+max_capacity:
+    type: 'int'
+    min: 500
+    max: 1000
+    complexity: "min"
+
+max_traffic:
+    type: 'int'
+    min: 25
+    max: 50
+    complexity: "max"
+
+num_communication_edges:
+    complexity: "max"
+    env_attribute: true
+    important: false
+
+num_traffic_edges:
+    complexity: "max"
+    env_attribute: true
+    important: false

@@ -1,0 +1,29 @@
+adj_num_negatives_per_positive: 5
+adj_tau: 0.5
+cont_loss_fun: mse
+dynamic_weights: false
+loss_combination_function: linear_loss
+proportional_cutoff_coefficient: 3
+save_logs_interval_train: 100
+save_logs_interval_val: 1
+save_logs_transitions: false
+switch_interval: 1
+switch_strategy: random
+temperature_dwa: 2
+val_interval: 500
+val_iterations: 100
+val_switch_interval: 1
+weights:
+  default:
+    adj_weight: 1
+    edge_feature_vector_binary_cat_weight: 1
+    edge_feature_vector_cont_weight: 1
+    edge_feature_vector_multi_cat_weight: 1
+    edge_feature_vector_ranking_weight: 1
+    edge_feature_vector_weight: 1
+    kl_weight: 1
+    node_feature_vector_binary_cat_weight: 1
+    node_feature_vector_cont_weight: 1
+    node_feature_vector_multi_cat_weight: 1
+    node_feature_vector_ranking_weight: 1
+    node_feature_vector_weight: 1

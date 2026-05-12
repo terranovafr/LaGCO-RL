@@ -1,0 +1,17 @@
+min_traffic: 1 # min traffic value
+max_traffic: 10 # max traffic value
+traffic_density: 0.8 # probability of having a traffic demand between two nodes
+
+extra_edge_probability: 0.05 # latency graph extra edge beyond the spanning tree
+
+invalid_action_penalty_sum: -10 # sum of penalties for invalid actions across the episode, to divide by number of steps, to push agent to find valid solutions
+same_pm_penalty_sum: 0 # sum of penalties for putting VMs on the same PM across the episode, to divide by number of steps
+
+# weighted sum score coefficients
+util_coefficient: 1
+packing_coefficient: 1
+power_coefficient: 1
+latency_coefficient: 1
+security_coefficient: 1
+add_movement_cost: false # in reward function
+movement_coefficient: 0

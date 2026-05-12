@@ -1,0 +1,12 @@
+num_cities:
+  type: 'int'
+  min: 10
+  max: 100
+  important: true
+  complexity: "max"
+  size_replacement: true
+
+max_coord:
+  type: 'int'
+  min: 100
+  max: 1000

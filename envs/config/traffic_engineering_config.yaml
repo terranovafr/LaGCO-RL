@@ -1,0 +1,13 @@
+always_feasible: true # enforces all actions to be feasible
+feasibility_coefficient: 0 # reward coefficient, whether feasibility is not ensure, to push agent to find feasible paths
+link_util_coefficient: 1 # reward coefficient for the link utilization part of the reward, to push agent to find paths with low link utilization
+util_aggregation: 'max' # which aggregation function to use to aggregate the link utilization across the path ('max', 'mean', 'min')
+
+graph_edges_distribution: 'spanning_tree' # or 'small_world'
+small_world_k: 4 # parameter in case of small world graph
+small_world_p: 0.1 # parameter in case of small world graph
+
+max_len_path: 4 # maximum length to consider for the paths to be possible actions (heuristic limiting explosion action space)
+no_change_penalty_sum: -3 # penalty sum across episode for not changing the path, to be divided by number of steps
+path_encoding: 'concat' # pooling to use to represent a path
+

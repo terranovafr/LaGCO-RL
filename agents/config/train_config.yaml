@@ -1,0 +1,69 @@
+max_steps_coefficient: 1
+cyberattack:
+  max_steps_coefficient: 3
+ospf_engineering:
+  max_steps_coefficient: 2
+traffic_engineering:
+  max_steps_coefficient: 2
+maxcut:
+  max_steps_coefficient: 2
+max_steps_overall: 10000
+max_sweeps: 5000
+checkpoints_save_freq: 10000
+pad_spaces: true
+norm_obs: false
+norm_reward: min-max
+terminate_at_approximate_best: true
+vgae_projection: mean
+plot_action_space: false
+plot_action_space_interval: 1000
+
+# approximate action space lookup
+approximate_distance: false
+IVF_nlist: 100
+distance_computation: faiss
+distance_metric: cosine
+distance_selection: classic
+distance_temperature: 0
+epsilon_lower: -1
+epsilon_upper: 1
+index_type: flat
+knn: 1
+
+# cache configuration
+cache_dir: cache
+cache_save_interval: 10
+
+# action space configuration
+no_action_factor: 0
+no_action_penalty_sum: -3
+no_action_support: false
+concatenate_actions_observation: true
+norm_action_space: z-score
+iterative:
+  norm_action_space: false
+padding_invalid_action_penalty_sum: -10
+tau_quartile: 100
+protoknn_heuristic: null
+remove_invalid_actions: true
+sample_subset_actions: 50
+sample_subset_actions_strategy: random
+
+# validation
+val_freq: 10000
+val_score_key: discounted_return
+val_switch_interval: 1
+n_val_episodes: 10
+
+# logs
+save_embeddings_interval_train: 100
+save_embeddings_interval_val: 1
+save_logs_interval_train: 100
+save_logs_interval_val: 1
+save_logs_transitions: false
+
+
+# switch
+switch_interval: 100
+switch_strategy: random
+

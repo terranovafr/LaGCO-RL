@@ -1,0 +1,15 @@
+# hyperparameters ranges to optionally explore for algorithm type and not RL algorithm
+# projection:
+#  default:
+#    norm_action_space:
+#      type: "categorical"
+#      values: [ false, "z-score", "min-max" ]
+#    norm_reward:
+#      type: "categorical"
+#      values: [ false, "z-score", "min-max" ]
+#    distance_metric:
+#      type: "categorical"
+#      values: [ "euclidean", "cosine" ]
+#    distance_selection:
+#      type: "categorical"
+#      values: [ "classic", "structured" ]

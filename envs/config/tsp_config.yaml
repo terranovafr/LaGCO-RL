@@ -1,0 +1,4 @@
+reward_type: 'relative' #  relative to worst and best or episodic or absolute
+invalid_action_penalty_sum: -10 # penalty for invalid action, sum of all in the episode, to push agent to find valid solutions
+hard_constraints: true # to have score != 0, ensure hard constraints (which are not considered as soft)
+shortest_K_edges: 10 # to keep to avoid fully connected graph for the GNN

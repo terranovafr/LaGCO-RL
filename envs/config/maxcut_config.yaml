@@ -1,0 +1,2 @@
+reward_type: 'relative' # relative to worst and best  relative to worst and best or episodic or absolute
+largest_K_edges: 10 # to keep to avoid fully connected graph for the GNN

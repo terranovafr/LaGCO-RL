@@ -1,0 +1,7 @@
+# test configurations overwriting training ones
+max_steps_coefficient: 10 # cut-off proportional to scenario size
+max_steps_overall: 100 # cut-off independent of scenario size
+switch_interval: 1 # ensures to see them the same number of times
+switch_strategy: 'sequential' # ensures them to be visited in the same order one after the other
+terminate_at_approximate_best: false # whether to stop the episode when reaching the approximate best solution (False in testing)
+distance_computation: "gpu"

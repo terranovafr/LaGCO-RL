@@ -1,0 +1,18 @@
+always_feasible: true # enforces all actions to be feasible
+feasibility_coefficient: 0 # reward coefficient, whether feasibility is not ensure, to push agent to find feasible paths
+link_util_coefficient: 1 # reward coefficient for the link utilization part of the reward, to push agent to find paths with low link utilization
+util_aggregation: 'max' # which aggregation function to use to aggregate the link utilization across the path ('max', 'mean', 'min')
+
+graph_edges_distribution: 'spanning_tree' # or 'small_world'
+small_world_k: 4 # parameter in case of small world graph
+small_world_p: 0.1 # parameter in case of small world graph
+
+routing_ecmp: true # whether to consider ECMP paths (i.e. all the paths with the same cost) or just one of them (randomly selected)
+
+reward_type: 'relative' #  relative to worst and best or episodic or absolute
+
+# weights configuration to explore
+bounded_weights: true # bound to a min and a max
+max_weight: 5
+min_weight: 1
+incremental_weight_by_unit: true # allow only +1, -1, 0 changes

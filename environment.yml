@@ -1,0 +1,50 @@
+name: lagcorl
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+
+  # ---- Core ML stack (CUDA-safe) ----
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # ---- Scientific stack ----
+  - numpy<2
+  - scipy
+  - pandas
+  - scikit-learn
+  - matplotlib==3.8
+  - networkx==2.8.8
+
+  # ---- Data / utils ----
+  - pip
+  - pip:
+      - gymnasium==0.29.1
+      - gym==0.26.2
+      - stable-baselines3==2.7.1
+      - sb3-contrib==2.3.0
+      - optuna==4.8.0
+
+      - transformers==5.7.0
+      - huggingface-hub==1.13.0
+      - tokenizers==0.22.2
+
+      - torch-geometric==2.7.0
+      - faiss-cpu==1.13.2
+
+      - umap-learn==0.5.12
+      - pynndescent==0.6.0
+
+      - tensorboard==2.20.0
+      - protobuf==3.20.3
+      - tqdm
+      - pyyaml
+      - joblib
+      - psutil
+      - rich

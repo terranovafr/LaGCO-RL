@@ -1,0 +1,36 @@
+# defines the environments to be used in the experiments, with their corresponding module, class, and score key (across those returned in metrics)
+
+cyberattack:
+  module: envs.env_cyberattack
+  class: ExtendedCyberAttackEnv
+  score_key: agent_compromised_nodes_percentage
+
+tsp:
+    module: envs.env_tsp
+    class: ExtendedTSPEnv
+    score_key: agent_relative_performance
+
+maxcut:
+    module: envs.env_maxcut
+    class: ExtendedMaxCutEnv
+    score_key: agent_relative_performance
+
+mvc:
+    module: envs.env_mvc
+    class: ExtendedMVCEnv
+    score_key: agent_relative_performance
+
+vmp:
+  module: envs.env_vmp
+  class: ExtendedVMPlacementEnv
+  score_key: agent_weighted_sum_difference
+
+traffic_engineering:
+  module: envs.env_traffic_engineering
+  class: ExtendedTrafficEngineeringEnv
+  score_key: agent_ideal_reduction_percentage_relative
+
+ospf_engineering:
+  module: envs.env_ospf_engineering
+  class: ExtendedOSPFTrafficEngineeringEnv
+  score_key: agent_ideal_reduction_percentage_relative

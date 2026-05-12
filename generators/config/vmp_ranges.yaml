@@ -1,0 +1,180 @@
+n_vms:
+  type: 'int'
+  min: 10
+  max: 50
+  complexity: "max"
+  important: true
+  size_replacement: true
+
+n_pms:
+  type: 'int'
+  min: 10
+  max: 50
+  complexity: "max"
+  important: true
+  size_replacement: true
+
+n_tenants:
+  type: 'int'
+  min: 2
+  max: 5
+  complexity: "max"
+
+# security
+
+vm_vuln_prob_min:
+    type: 'float'
+    min: 0.01
+    max: 0.1
+    complexity: "max"
+
+vm_vuln_prob_max:
+    type: 'float'
+    min: 0.2
+    max: 1
+    complexity: "max"
+
+pm_escape_prob_min:
+    type: 'float'
+    min: 0.01
+    max: 0.1
+    complexity: "max"
+
+pm_escape_prob_max:
+    type: 'float'
+    min: 0.2
+    max: 0.33
+    complexity: "max"
+
+
+# memory
+
+pm_capacity_memory_min:
+    type: 'int'
+    min: 32
+    max: 64
+    complexity: "min"
+
+pm_capacity_memory_max:
+    type: 'int'
+    min: 128
+    max: 512
+    complexity: "min"
+
+vm_demand_memory_min:
+    type: 'int'
+    min: 1
+    max: 8
+    complexity: "max"
+
+vm_demand_memory_max:
+    type: 'int'
+    min: 16
+    max: 24
+    complexity: "max"
+
+# storage
+
+pm_capacity_storage_min:
+    type: 'int'
+    min: 100
+    max: 500
+    complexity: "min"
+
+pm_capacity_storage_max:
+    type: 'int'
+    min: 1000
+    max: 5000
+    complexity: "min"
+
+
+vm_demand_storage_min:
+    type: 'int'
+    min: 10
+    max: 50
+    complexity: "max"
+
+vm_demand_storage_max:
+    type: 'int'
+    min: 60
+    max: 100
+    complexity: "max"
+
+# cpu
+
+pm_capacity_pe_min:
+    type: 'int'
+    min: 8
+    max: 16
+    complexity: "min"
+
+pm_capacity_pe_max:
+    type: 'int'
+    min: 32
+    max: 128
+    complexity: "min"
+
+
+vm_demand_pe_min:
+    type: 'int'
+    min: 2
+    max: 4
+    complexity: "max"
+
+vm_demand_pe_max:
+    type: 'int'
+    min: 8
+    max: 16
+    complexity: "max"
+
+# mips
+
+pm_capacity_mips_min:
+    type: 'int'
+    min: 1000
+    max: 5000
+    complexity: "min"
+
+pm_capacity_mips_max:
+    type: 'int'
+    min: 10000
+    max: 50000
+    complexity: "min"
+
+vm_demand_mips_min:
+    type: 'int'
+    min: 100
+    max: 500
+    complexity: "max"
+
+vm_demand_mips_max:
+    type: 'int'
+    min: 750
+    max: 1000
+    complexity: "max"
+
+# latency
+
+latency_min:
+    type: 'float'
+    min: 0.1
+    max: 1
+    complexity: "max"
+
+latency_max:
+    type: 'int'
+    min: 2
+    max: 8
+    complexity: "max"
+
+# power
+
+p_idle:
+    type: 'float'
+    min: 50
+    max: 100
+
+p_peak:
+    type: 'float'
+    min: 150
+    max: 300

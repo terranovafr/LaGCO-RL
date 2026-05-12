@@ -1,0 +1,2 @@
+switch_strategy: 'sequential'
+switch_interval: 1
