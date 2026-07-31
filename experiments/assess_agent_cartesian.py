@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# Licensed under the MIT License.
+# This file is licensed under the GNU General Public License v3.0.
+# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# See the LICENSE file in the project root for the full license text.
 
 '''
 This script runs a full pipeline of experiments to assess the performance of RL agents trained on a single environment and tested on a range of environments of increasing difficulty/size.

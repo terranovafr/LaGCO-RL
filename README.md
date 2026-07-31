@@ -1,8 +1,10 @@
 # LaGCO-RL: Reinforcement Learning in Latent Action Spaces for Graph Combinatorial Optimization
 
 [![PhD theses.fr](https://img.shields.io/badge/Project-theses.fr-orange?logo=university&logoColor=white)](https://theses.fr/s371241)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![BIL](https://img.shields.io/badge/BIL-Base%20Information%20Logiciel-purple?logo=information&logoColor=white)](https://bil.inria.fr/fr/software/view/5855/tab)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/license/gpl-3.0)
 [![Zenodo](https://img.shields.io/badge/Zenodo-Data%20Repository-lightblue?logo=information&logoColor=white)](https://zenodo.org/records/20019625)
+[![Paper](https://img.shields.io/badge/Paper-Preprint-blue?logo=readthedocs)](https://hal.science/hal-05620445v1)
 
 This project provides a modular framework for constructing **latent action spaces** and **semantically aligned latent observation spaces** for reinforcement learning (RL) in graph-based combinatorial optimization by using graph neural network (GNN) embeddings.
 
@@ -236,6 +238,9 @@ If you use this code in your research, please cite the following paper:
   year={2026}
 }
 ```
+
+## GPL-3.0 LICENSE
+The code in this repository is available under the GPL-3.0 License, see the LICENSE file for more information.
 
 ## Acknowledgments
 
