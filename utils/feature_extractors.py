@@ -4,6 +4,7 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 '''
     feature_extractors.py
     This module provides various feature extraction methods for different types of data.
@@ -42,11 +43,11 @@ _tokenizer_cache = {}
 def LanguageModelEmbedding(element, model_name, hf_key, language_mapping=None):
     # Generates an embedding for the input element using a specified language model. It first checks if the tokenizer and model for the given model name are already cached; if not, it loads them from Hugging Face. The input element can be optionally mapped to a different value using a provided language mapping. The function then tokenizes the input with truncation to fit the model's maximum length and computes the mean pooling of the token embeddings to produce a fixed-size vector representation of the input.
     if model_name not in _tokenizer_cache:
-        _tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(model_name, use_auth_token=hf_key)
+        _tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(model_name, token=hf_key)
     tokenizer = _tokenizer_cache[model_name]
 
     if model_name not in _model_cache:
-        _model_cache[model_name] = AutoModel.from_pretrained(model_name, use_auth_token=hf_key)
+        _model_cache[model_name] = AutoModel.from_pretrained(model_name, token=hf_key)
     model = _model_cache[model_name]
 
     if language_mapping is not None:

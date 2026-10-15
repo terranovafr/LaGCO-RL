@@ -7,6 +7,8 @@ traffic_engineering:
   max_steps_coefficient: 2
 maxcut:
   max_steps_coefficient: 2
+mvc:
+  max_steps_coefficient: 2
 max_steps_overall: 10000
 max_sweeps: 5000
 checkpoints_save_freq: 10000
@@ -38,7 +40,7 @@ cache_save_interval: 10
 no_action_factor: 0
 no_action_penalty_sum: -3
 no_action_support: false
-concatenate_actions_observation: true
+concatenate_actions_observation: false
 norm_action_space: z-score
 iterative:
   norm_action_space: false

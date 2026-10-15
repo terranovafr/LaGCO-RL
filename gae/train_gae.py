@@ -18,6 +18,7 @@ import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.log_utils import setup_logging
+from utils.train_utils import apply_overrides
 from torch_geometric.data import DataLoader
 from gae_utils import compute_backward_batch_train_loss
 from model import GAE, VGAE
@@ -27,6 +28,7 @@ from utils.math_utils import set_seeds, HybridMagnitudeDWAWeighting
 from pathlib import Path
 from utils.file_utils import save_yaml, read_split_file, load_yaml
 from tqdm import tqdm
+import re
 from wrappers.gae_training_wrapper import GAETrainingWrapper
 from torch_geometric.utils import from_networkx
 import numpy as np
@@ -46,8 +48,12 @@ def load_envs(config, envs_folder):
         # wrap in the environments
         config['num_environments'] = 0
         keys_config = {k: v for k, v in general_config.items() if isinstance(v, dict) and 'key' in v}
+        pattern = re.compile(r"^\d+(?:_\d+)?$")
         for index, folder in tqdm(enumerate(os.listdir(file_path)), desc="Loading networks"):
-            if os.path.isdir(os.path.join(file_path, folder)) and folder.isdigit():
+            if (
+                    os.path.isdir(os.path.join(file_path, folder))
+                    and pattern.match(folder)
+            ):
                 config['num_environments'] += 1
                 env_folder = os.path.join(file_path, folder, f"env.pkl")
                 with open(env_folder, 'rb') as f:
@@ -131,12 +137,25 @@ def compute_losses_no_backward(models, envs, config):
             losses[graph_name]["edge_continuous_loss"].append(edge_continuous_loss)
             losses[graph_name]["edge_ranking_loss"].append(edge_ranking_loss)
 
-    # Average
-    for g in losses:
-        for k in losses[g]:
-            losses[g][k] = float(np.mean(losses[g][k]))
+    # Keep raw losses AND compute statistics
+    stats = {}
 
-    return losses
+    for g in losses:
+        stats[g] = {}
+
+        for k in losses[g]:
+            values = np.array(losses[g][k], dtype=float)
+
+            stats[g][k] = {
+                "values": values.tolist(),
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "min": float(np.min(values)),
+                "max": float(np.max(values)),
+                "num_samples": len(values)
+            }
+
+    return stats
 
 
 # Initialize model and optimizer, with model initialized with the graph from the sample environment (determining feature vector attributes)
@@ -162,24 +181,82 @@ def init_models(sample_env, config):
     for G_name in Gs:
         copy_config = deepcopy(config)
         model = None
+
+        # Handle graphs without edge features (NNConv cannot have in_features=0)
+        if copy_config['edge_feature_vector_size'][G_name] == 0:
+            # Remove the first NNConv layer and duplicate the second layer
+            copy_config['model_config']['layers'] = [config['model_config']['layers'][1]]
+            additional_layers = config['model_config']['layers'][1:]
+
+            if isinstance(additional_layers, list):
+                copy_config['model_config']['layers'] += additional_layers
+            else:
+                copy_config['model_config']['layers'].append(additional_layers)
+
         if config['model_type'] == "gae":
-            # check that all have G_name in config for the required keys
-            if config['edge_feature_vector_size'][G_name] == 0:
-                # repeat twice second layer and remove first one
-                copy_config['model_config']['layers'] = [config['model_config']['layers'][1]]
-                additional_layers = config['model_config']['layers'][1:]
-                # check if it is list
-                if isinstance(additional_layers, list):
-                    copy_config['model_config']['layers'] += additional_layers
-                else:
-                    copy_config['model_config']['layers'].append(additional_layers)
-            for key in ['node_feature_vector_size', 'edge_feature_vector_size', 'binary_indices', 'multi_class_info', 'multi_class_info_order', 'continuous_indices', 'edge_binary_indices', 'edge_continuous_indices', 'edge_multi_class_info', 'edge_multi_class_info_order']:
+            for key in [
+                'node_feature_vector_size',
+                'edge_feature_vector_size',
+                'binary_indices',
+                'multi_class_info',
+                'multi_class_info_order',
+                'continuous_indices',
+                'edge_binary_indices',
+                'edge_continuous_indices',
+                'edge_multi_class_info',
+                'edge_multi_class_info_order'
+            ]:
                 if G_name not in config[key]:
                     raise ValueError(f"Graph name {G_name} not found in config for key {key}")
-            model = GAE(copy_config['node_feature_vector_size'][G_name], copy_config['model_config']['layers'], copy_config['edge_feature_vector_size'][G_name], copy_config['binary_indices'][G_name], copy_config['multi_class_info'][G_name], copy_config['multi_class_info_order'][G_name], copy_config['continuous_indices'][G_name], copy_config['ranking_indices'][G_name], copy_config['edge_binary_indices'][G_name], copy_config['edge_continuous_indices'][G_name], copy_config['edge_multi_class_info'][G_name], copy_config['edge_multi_class_info_order'][G_name], copy_config['edge_ranking_indices'][G_name]) #config['num_edge_types'][G_name])
-        elif config['model_type'] == 'vgae':
-            model = VGAE(copy_config['node_feature_vector_size'][G_name], copy_config['model_config']['layers'], copy_config['edge_feature_vector_size'][G_name], copy_config['binary_indices'][G_name], copy_config['multi_class_info'][G_name], copy_config['multi_class_info_order'][G_name], copy_config['continuous_indices'][G_name], copy_config['ranking_indices'][G_name], copy_config['edge_binary_indices'][G_name], copy_config['edge_continuous_indices'][G_name], copy_config['edge_multi_class_info'][G_name], copy_config['edge_multi_class_info_order'][G_name], copy_config['edge_ranking_indices'][G_name], copy_config['latent_dim_vgae'])
 
+            model = GAE(
+                copy_config['node_feature_vector_size'][G_name],
+                copy_config['model_config']['layers'],
+                copy_config['edge_feature_vector_size'][G_name],
+                copy_config['binary_indices'][G_name],
+                copy_config['multi_class_info'][G_name],
+                copy_config['multi_class_info_order'][G_name],
+                copy_config['continuous_indices'][G_name],
+                copy_config['ranking_indices'][G_name],
+                copy_config['edge_binary_indices'][G_name],
+                copy_config['edge_continuous_indices'][G_name],
+                copy_config['edge_multi_class_info'][G_name],
+                copy_config['edge_multi_class_info_order'][G_name],
+                copy_config['edge_ranking_indices'][G_name]
+            )
+
+        elif config['model_type'] == "vgae":
+            for key in [
+                'node_feature_vector_size',
+                'edge_feature_vector_size',
+                'binary_indices',
+                'multi_class_info',
+                'multi_class_info_order',
+                'continuous_indices',
+                'edge_binary_indices',
+                'edge_continuous_indices',
+                'edge_multi_class_info',
+                'edge_multi_class_info_order'
+            ]:
+                if G_name not in config[key]:
+                    raise ValueError(f"Graph name {G_name} not found in config for key {key}")
+
+            model = VGAE(
+                copy_config['node_feature_vector_size'][G_name],
+                copy_config['model_config']['layers'],
+                copy_config['edge_feature_vector_size'][G_name],
+                copy_config['binary_indices'][G_name],
+                copy_config['multi_class_info'][G_name],
+                copy_config['multi_class_info_order'][G_name],
+                copy_config['continuous_indices'][G_name],
+                copy_config['ranking_indices'][G_name],
+                copy_config['edge_binary_indices'][G_name],
+                copy_config['edge_continuous_indices'][G_name],
+                copy_config['edge_multi_class_info'][G_name],
+                copy_config['edge_multi_class_info_order'][G_name],
+                copy_config['edge_ranking_indices'][G_name],
+                copy_config['latent_dim_vgae']
+            )
         models[G_name] = model
         optimizer = torch.optim.Adam(model.parameters(), lr=config['model_config']['learning_rate'])
         optimizers[G_name] = optimizer
@@ -194,6 +271,32 @@ def train_and_eval(config, envs, models, optimizers, writer, logger, logs_folder
     best_val_loss = float('inf')
     average_train_loss = None
     best_model_states = {name: None for name in models}  # store best encoder states
+    # Special case: no training, just save the randomly initialized model
+    if config["train_iterations"] == 0:
+        for model_name in models:
+            model_path = os.path.join(logs_folder, model_name)
+            os.makedirs(model_path, exist_ok=True)
+
+            torch.save(
+                models[model_name].encoder.state_dict(),
+                os.path.join(model_path, "encoder_final.pth"),
+            )
+            torch.save(
+                models[model_name].state_dict(),
+                os.path.join(model_path, "model_final.pth"),
+            )
+
+            # Optional: also save as best validation model so downstream code
+            # expecting this file continues to work.
+            torch.save(
+                models[model_name].encoder.state_dict(),
+                os.path.join(model_path, "encoder_best_val.pth"),
+            )
+
+        if config["verbose"]:
+            logger.info("train_iterations=0: saved randomly initialized GAE.")
+
+        return 0.0
 
     for model_name in models:
         dwa = HybridMagnitudeDWAWeighting(loss_names=[
@@ -273,9 +376,9 @@ def train_and_eval(config, envs, models, optimizers, writer, logger, logs_folder
                                 'node_feature_vector_multi_cat_weight'],
                             cont_weight=config['weights'][config['environment']]['node_feature_vector_cont_weight'],
                             ranking_weight=config['weights'][config['environment']].get('node_feature_vector_ranking_weight', 0.0),
-                            edge_binary_weight=config['weights'][config['environment']]['edge_feature_vector_binary_cat_weight'],
+                            edge_binary_cat_weight=config['weights'][config['environment']]['edge_feature_vector_binary_cat_weight'],
                             edge_multi_cat_weight=config['weights'][config['environment']]['edge_feature_vector_multi_cat_weight'],
-                            edge_continuous_weight=config['weights'][config['environment']]['edge_feature_vector_cont_weight'],
+                            edge_cont_weight=config['weights'][config['environment']]['edge_feature_vector_cont_weight'],
                             edge_ranking_weight=config['weights'][config['environment']].get('edge_feature_vector_ranking_weight', 0.0),
                             kl_weight=config['weights'][config['environment']].get('kl_weight', 0.0),
                             **config)
@@ -394,20 +497,50 @@ def execute_runs(config, original_logs_folder, envs_folder, logger):
 
             logger.info(f"Computing compression baseline using {config['num_random_initializations']} random initializations")
 
-            for _ in tqdm(range(config['num_random_initializations']), desc="Random inits for compression baseline"):
-                # Re-init models
+            baseline_losses = []
+
+            for rand_id in tqdm(
+                    range(config['num_random_initializations']),
+                    desc="Random initializations"):
+                # different initialization
                 rand_models, _, _ = init_models(env, config)
-                rand_losses = compute_losses_no_backward(rand_models, env, config)
-                baseline_losses.append(rand_losses)
+
+                rand_losses = compute_losses_no_backward(
+                    rand_models,
+                    env,
+                    config
+                )
+
+                baseline_losses.append({
+                    "random_id": rand_id,
+                    "losses": rand_losses
+                })
 
             # Average baseline losses
-            baseline_mean = {}
-            for graph_name in baseline_losses[0]:
-                baseline_mean[graph_name] = {}
-                for loss_name in baseline_losses[0][graph_name]:
-                    baseline_mean[graph_name][loss_name] = float(np.mean(
-                        [b[graph_name][loss_name] for b in baseline_losses]
-                    ))
+            baseline_statistics = {}
+
+            for graph_name in baseline_losses[0]["losses"]:
+
+                baseline_statistics[graph_name] = {}
+
+                for loss_name in baseline_losses[0]["losses"][graph_name]:
+
+                    vals = []
+
+                    for run in baseline_losses:
+                        vals.append(
+                            run["losses"][graph_name][loss_name]["mean"]
+                        )
+
+                    vals = np.array(vals)
+
+                    baseline_statistics[graph_name][loss_name] = {
+                        "values": vals.tolist(),
+                        "mean": float(vals.mean()),
+                        "std": float(vals.std()),
+                        "min": float(vals.min()),
+                        "max": float(vals.max()),
+                    }
 
             score = train_and_eval(config, envs_switcher, models, optimizers, writer, logger, logs_folder) # give general config since parameters used are the same
             # === Trained losses ===
@@ -419,8 +552,8 @@ def execute_runs(config, original_logs_folder, envs_folder, logger):
                 cr_vals = []
 
                 for loss_name in trained_losses[graph_name]:
-                    L0 = baseline_mean[graph_name][loss_name]
-                    Lt = trained_losses[graph_name][loss_name]
+                    L0 = baseline_statistics[graph_name][loss_name]["mean"]
+                    Lt = trained_losses[graph_name][loss_name]["mean"]
 
                     cr = max(0.0, min(1.0, (L0 - Lt) / max(L0, 1e-8)))
                     compression[graph_name][loss_name] = cr
@@ -431,15 +564,29 @@ def execute_runs(config, original_logs_folder, envs_folder, logger):
 
             compression_path = os.path.join(logs_folder, "compression_ratios.yaml")
             with open(compression_path, "w") as f:
-                yaml.dump(
-                    {
-                        "baseline_losses": baseline_mean,
-                        "trained_losses": trained_losses,
-                        "compression_ratios": compression,
-                    },
-                    f,
-                    sort_keys=False
-                )
+                with open(compression_path, "w") as f:
+                    yaml.dump(
+                        {
+                            "random_initializations": baseline_losses,
+
+                            "random_statistics": baseline_statistics,
+
+                            "trained_model_losses": trained_losses,
+
+                            "compression_ratios": compression,
+
+                            "metadata": {
+                                "num_random_initializations":
+                                    config['num_random_initializations'],
+                                "model_type":
+                                    config['model_type'],
+                                "seed":
+                                    config.get("seeds", None)
+                            }
+                        },
+                        f,
+                        sort_keys=False
+                    )
 
             logger.info(f"Compression ratios saved to {compression_path}")
         else:
@@ -479,6 +626,12 @@ if __name__ == "__main__":
                         help="Force saving environment as default")
     parser.add_argument("--compare_random_init", action="store_true", default=False,
                         help="Skip computation of random initialization compression baseline")
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help="Override config values. Example: --override train_iterations=5000 validation=true algorithm_hyperparams.gamma=0.99"
+    )
     args = parser.parse_args()
 
     # Creating logs folder
@@ -526,6 +679,7 @@ if __name__ == "__main__":
     # not updated if loaded configuration file from previous experiment
     config.update({"seeds": seeds_runs})
     config.update(vars(args))
+    config = apply_overrides(config, args.override)
     score = execute_runs(config, logs_folder, envs_folder, logger)
 
     if args.force_saving:

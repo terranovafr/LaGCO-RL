@@ -4,6 +4,7 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 from utils.features_utils import get_number_nodes, get_number_edges, get_average_node_degree, get_graph_density
 from utils.model import Node, Graph, Object, Attribute, Function, ActionSpace
 from utils.feature_extractors import OneHotEncoding, LanguageModelEmbedding
@@ -141,6 +142,7 @@ class CyberAttackEnv(DiscreteEnv):
         # will affect action space so need to rebuild
         self.action_list = self.build_action_list()
         self.semantic_action_list = self.build_semantic_action_list()
+        self.post_init()
 
     def save_step_log(self):
         super().save_step_log()
@@ -471,9 +473,14 @@ class CyberAttackEnv(DiscreteEnv):
         # CVE must exist on target
         cve_info = None
         for vuln in tgt_info["vulns"]:
-            if vuln["cve_id"] == cve_id:
-                cve_info = vuln
-                break
+            if cve_id.startswith("CVE-ID"):
+                if vuln["cve_id"] == cve_id:
+                    cve_info = vuln
+                    break
+            else:
+                if vuln["description"] == cve_id:
+                    cve_info = vuln
+                    break
 
         if cve_info is None:
             if self.verbose > 2:

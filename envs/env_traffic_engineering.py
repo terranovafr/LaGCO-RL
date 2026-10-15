@@ -4,6 +4,8 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
+
 import copy
 from tqdm import tqdm
 from gymnasium import spaces
@@ -172,6 +174,8 @@ class TrafficEngineeringEnv(DiscreteEnv):
         self.max_num_communication_edges = self.num_nodes * (self.num_nodes - 1)  # fully connected directed graph
         self.max_num_traffic_edges = self.num_nodes * (self.num_nodes - 1)
         self.chosen_paths_per_edge = {}
+        self.revisiting = kwargs.get("revisiting", False)
+        self.visited_traffic_edges = set()
 
         # Observation: concatenated edge features [capacity, weight, used_capacity] + traffic matrix
         obs_len = len(self.communication_edges) * 3 + len(self.traffic_edges)  # capacity, weight, used_capacity for each communication edge + traffic for each traffic edge
@@ -187,10 +191,46 @@ class TrafficEngineeringEnv(DiscreteEnv):
 
     def build_action_list(self):
         self.discrete_routing_options = []
-        for edge in self.routing_dict:
-            for path in self.routing_dict[edge]:
-                self.discrete_routing_options.append((edge, path))
+        for traffic_edge in self.routing_dict:
+            if (
+                    not self.revisiting
+                    and traffic_edge in self.visited_traffic_edges
+            ):
+                continue
+
+            for path in self.routing_dict[traffic_edge]:
+                self.discrete_routing_options.append(
+                    (traffic_edge, path)
+                )
+
         return self.discrete_routing_options
+
+    def build_semantic_action_list(self):
+        sorted_edges = sorted(
+            self.traffic_edges,
+            key=lambda e: self.traffic_graph[e[0]][e[1]]['edge_attr_dict']['traffic'],
+            reverse=True
+        )
+        mapping = []
+
+        # Semantic cartesian product
+        for edge in sorted_edges:
+            if (
+                    not self.revisiting
+                    and edge in self.visited_traffic_edges
+            ):
+                continue
+
+            paths = self.routing_dict[edge]
+            sorted_paths = sorted(
+                paths,
+                # use len
+                key=len,
+                reverse=False
+            )
+            for path in sorted_paths:
+                mapping.append((edge, path))
+        return mapping
 
     def _find_routing_options(self):
         # For each traffic edge, find all simple paths in the communication graph up to max_len_path
@@ -718,8 +758,12 @@ class TrafficEngineeringEnv(DiscreteEnv):
     def reset(self, **kwargs):
         super().pre_reset()
         # Reset weights to initial stage, as well as data structures related
+        self.total_traffic_edge_selections = 0
+        self.unique_traffic_edge_selections = set()
+        self.repeated_traffic_edge_selections = 0
         self.communication_graph = copy.deepcopy(self.initial_communication_graph)
         self.allocations = copy.deepcopy(self.initial_allocations)
+        self.visited_traffic_edges = set()
         if self.verbose > 1:
             print("Resetting environment. Initial communication graph restored.")
 
@@ -737,6 +781,7 @@ class TrafficEngineeringEnv(DiscreteEnv):
             # count unique paths
             unique_paths = set(tuple(path) for path in self.chosen_paths_per_edge[edge])
         self.chosen_paths_per_edge = {}
+
         self.initial_feasible = 1 if feasible else 0
 
         if self.verbose > 1:
@@ -762,6 +807,9 @@ class TrafficEngineeringEnv(DiscreteEnv):
 
     def is_valid_action(self, traffic_edge, communication_path):
         # Action is valid if the communication path can accommodate the traffic demand of the traffic edge without exceeding capacities
+        if not self.revisiting:
+            if traffic_edge in self.visited_traffic_edges:
+                return False
         demand = self.traffic_graph[traffic_edge[0]][traffic_edge[1]]['edge_attr_dict']['traffic']
         for u, v in zip(communication_path[:-1], communication_path[1:]):
             cap = self.communication_graph[u][v]['edge_attr_dict']['capacity']
@@ -771,45 +819,264 @@ class TrafficEngineeringEnv(DiscreteEnv):
         return True
 
     def update_config(self, config):
+        super().update_config(config)
+        self.visited_traffic_edges = set()
+        self.unique_traffic_edge_selections = set()
+        self.repeated_traffic_edge_selections = 0
+        self.total_traffic_edge_selections = 0
         self.feasibility_coefficient = config.get('feasibility_coefficient', self.feasibility_coefficient)
         self.link_util_coefficient = config.get('link_util_coefficient', self.link_util_coefficient)
         self.util_aggregation = config.get('util_aggregation', self.util_aggregation)
         self.max_len_path = config.get('max_len_path', self.max_len_path)
+        self.revisiting = config.get('revisiting', self.revisiting if hasattr(self, 'revisiting') else False)
         # find routing options again
         self.routing_dict = self._find_routing_options()
         # need to rebuild action list and semantic action map since routing options may have changed
         self.action_list = self.build_action_list()
         self.semantic_action_list = self.build_semantic_action_list()
+        self.post_init()
         super().reconstruct_action_space()
 
-    def build_semantic_action_list(self):
-        sorted_edges = sorted(
-            self.traffic_edges,
-            key=lambda e: self.traffic_graph[e[0]][e[1]]['edge_attr_dict']['traffic'],
-            reverse=True
-        )
-        mapping = []
 
-        # Semantic cartesian product
-        for edge in sorted_edges:
-            paths = self.routing_dict[edge]
-            sorted_paths = sorted(
-                paths,
-                # use len
-                key=len,
-                reverse=False
-            )
-            for path in sorted_paths:
-                mapping.append((edge, path))
-        return mapping
 
     def step(self, traffic_edge, communication_path=None):
+
+        if self.revisiting:
+            return self.step_revisiting(
+                traffic_edge,
+                communication_path
+            )
+        else:
+            return self.step_non_revisiting(
+                traffic_edge,
+                communication_path
+            )
+
+    def step_non_revisiting(
+            self,
+            traffic_edge,
+            communication_path=None
+    ):
+
+        action = super().pre_step(
+            (traffic_edge, communication_path)
+        )
+
+        if not self.invalid_action and not self.no_action:
+
+            traffic_edge, communication_path = action
+
+            u, v = traffic_edge
+            traffic_edge = (u, v)
+            edge_key = tuple(traffic_edge)
+
+            self.total_traffic_edge_selections += 1
+
+            if edge_key in self.unique_traffic_edge_selections:
+                self.repeated_traffic_edge_selections += 1
+
+            self.unique_traffic_edge_selections.add(edge_key)
+            # ---------------------------------------------
+            # NON-REVISITING:
+            # demand can only be selected once
+            # ---------------------------------------------
+            if traffic_edge in self.visited_traffic_edges:
+
+                self.reward = self.no_change_penalty_sum / (
+                        self.max_steps_coefficient
+                        * len(self.traffic_graph.edges)
+                )
+
+                self.no_change_actions += 1
+
+            else:
+
+                self.visited_traffic_edges.add(
+                    traffic_edge
+                )
+
+                self.targeted_edges.add(
+                    traffic_edge
+                )
+
+                previous_allocation = (
+                    self.allocations[traffic_edge]
+                )
+
+                self.previous_communication_path = (
+                    previous_allocation
+                )
+
+                demand = self.traffic_graph[u][v][
+                    'edge_attr_dict'
+                ]['traffic']
+
+                # -----------------------------------------
+                # Assign the selected path
+                # -----------------------------------------
+
+                if previous_allocation != communication_path:
+
+                    self.change_actions += 1
+
+                    # Remove old path
+                    for a, b in zip(
+                            previous_allocation[:-1],
+                            previous_allocation[1:]
+                    ):
+                        self.communication_graph[a][b][
+                            'edge_attr_dict'
+                        ]['used_capacity'] -= demand
+
+                        self.communication_graph[a][b][
+                            'edge_attr_dict'
+                        ]['used_capacity_ratio'] = (
+                                self.communication_graph[a][b][
+                                    'edge_attr_dict'
+                                ]['used_capacity']
+                                /
+                                self.communication_graph[a][b][
+                                    'edge_attr_dict'
+                                ]['capacity']
+                        )
+
+                    # Add new path
+                    for a, b in zip(
+                            communication_path[:-1],
+                            communication_path[1:]
+                    ):
+                        self.communication_graph[a][b][
+                            'edge_attr_dict'
+                        ]['used_capacity'] += demand
+
+                        self.communication_graph[a][b][
+                            'edge_attr_dict'
+                        ]['used_capacity_ratio'] = (
+                                self.communication_graph[a][b][
+                                    'edge_attr_dict'
+                                ]['used_capacity']
+                                /
+                                self.communication_graph[a][b][
+                                    'edge_attr_dict'
+                                ]['capacity']
+                        )
+
+                    self.allocations[
+                        traffic_edge
+                    ] = communication_path
+
+                else:
+                    self.no_change_actions += 1
+
+                # -----------------------------------------
+                # Same original reward calculation
+                # -----------------------------------------
+
+                (
+                    feasible,
+                    link_utils,
+                    _,
+                    self.current_feasible_percentage
+                ) = self._compute_allocation_stats(
+                    self.allocations
+                )
+
+                if self.util_aggregation == 'max':
+                    self.current_util = (
+                        max(link_utils.values())
+                        if link_utils else 0.0
+                    )
+                elif self.util_aggregation == 'mean':
+                    self.current_util = (
+                        np.mean(list(link_utils.values()))
+                        if link_utils else 0.0
+                    )
+
+                if self.prev_feasible_percentage != 0:
+
+                    feasibility_change = (
+                                                 self.current_feasible_percentage
+                                                 - self.prev_feasible_percentage
+                                         ) / self.prev_feasible_percentage
+
+                else:
+                    feasibility_change = 0.0
+
+                if self.always_feasible:
+                    assert (
+                            self.current_feasible_percentage == 1.0
+                    )
+
+                if self.prev_util != 0:
+
+                    util_change = (
+                                          self.prev_util - self.current_util
+                                  ) / (
+                                          self.initial_util - self.best_util
+                                  )
+
+                else:
+                    util_change = 0.0
+
+                self.reward = (
+                        self.feasibility_coefficient
+                        * feasibility_change
+                        +
+                        self.link_util_coefficient
+                        * util_change
+                )
+
+                self.prev_util = self.current_util
+                self.prev_feasible_percentage = (
+                    self.current_feasible_percentage
+                )
+
+        # ---------------------------------------------
+        # Constructive termination
+        # ---------------------------------------------
+
+        self.done = (
+                len(self.visited_traffic_edges)
+                >= len(self.traffic_edges)
+        )
+
+        if self.terminate_at_approximate_best:
+            self.done |= (
+                    self.current_util <= self.best_util
+            )
+
+        self.obs = self._get_obs()
+        self.action = (
+            traffic_edge,
+            communication_path
+        )
+        self.info = {}
+
+        super().post_step()
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info
+        )
+
+    def step_revisiting(self, traffic_edge, communication_path=None):
         action = super().pre_step((traffic_edge, communication_path))
 
         if not self.invalid_action and not self.no_action:
             traffic_edge, communication_path = action
 
             u, v = traffic_edge
+            edge_key = tuple(traffic_edge)
+
+            self.total_traffic_edge_selections += 1
+
+            if edge_key in self.unique_traffic_edge_selections:
+                self.repeated_traffic_edge_selections += 1
+
+            self.unique_traffic_edge_selections.add(edge_key)
             if not (u, v) in self.chosen_paths_per_edge:
                 self.chosen_paths_per_edge[(u, v)] = []
             self.chosen_paths_per_edge[(u, v)].append(communication_path)
@@ -957,16 +1224,82 @@ class TrafficEngineeringEnv(DiscreteEnv):
 
     def update_metrics(self):
         super().update_metrics()
+
+        total_steps = self.current_step
+
+        unique_edges = len(self.unique_traffic_edge_selections)
+        repeated_edges = self.repeated_traffic_edge_selections
+
         self._metrics.update({
-            'initial_link_utilization': self.initial_util,
-            'current_link_utilization': self.current_util,
-            'ideal_reduction_percentage_relative': (self.initial_util - self.current_util) / (self.initial_util - self.best_util) if (self.initial_util - self.best_util) > 0 else 0.0,
-            'link_utilization_difference': self.current_util - self.initial_util,
-            'feasible_difference': self.current_feasible - self.initial_feasible,
-            'feasibility_percentage_difference': self.current_feasible_percentage - self.initial_feasible_percentage,
-            'change_actions': self.change_actions / self.current_step if self.current_step > 0 else 0.0,
-            'no_change_actions': self.no_change_actions / self.current_step if self.current_step > 0 else 0.0,
-            'targeted_edges': len(self.targeted_edges),
+
+            # -------------------------
+            # Performance
+            # -------------------------
+
+            'initial_link_utilization':
+                self.initial_util,
+
+            'current_link_utilization':
+                self.current_util,
+
+            'ideal_reduction_percentage_relative': (
+                (self.initial_util - self.current_util) /
+                (self.initial_util - self.best_util)
+                if (self.initial_util - self.best_util) > 0
+                else 0.0
+            ),
+
+            'link_utilization_difference':
+                self.current_util - self.initial_util,
+
+            'feasible_difference':
+                self.current_feasible - self.initial_feasible,
+
+            'feasibility_percentage_difference':
+                self.current_feasible_percentage -
+                self.initial_feasible_percentage,
+
+            # -------------------------
+            # Revisiting diagnostics
+            # -------------------------
+
+            'unique_traffic_edges_selected':
+                unique_edges,
+
+            'total_traffic_edge_selections':
+                self.total_traffic_edge_selections,
+
+            'repeated_traffic_edge_selections':
+                repeated_edges,
+
+            'revisit_rate':
+                repeated_edges / total_steps
+                if total_steps > 0 else 0.0,
+
+            'traffic_edge_coverage':
+                unique_edges / self.num_traffic_edges
+                if self.num_traffic_edges > 0 else 0.0,
+
+            # -------------------------
+            # Action behavior
+            # -------------------------
+
+            'change_actions':
+                self.change_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            'no_change_actions':
+                self.no_change_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            # -------------------------
+            # Existing targeting
+            # -------------------------
+
+            'targeted_edges':
+                len(self.targeted_edges) /
+                self.num_traffic_edges
+                if self.num_traffic_edges > 0 else 0.0,
         })
 
 def edge_key_from_tuple(x):
@@ -1000,6 +1333,10 @@ class ExtendedTrafficEngineeringEnv(TrafficEngineeringEnv, ContinuousEnv):
             self.routing_dict_formatted[key_name] = self.routing_dict[edge]
 
         if self.path_encoding == 'concat':
+            poolings = [ConcatPooling]
+        else: #if self.path_encoding == 'pooling':
+            poolings = [MeanPooling, SumPooling]
+        if self.revisiting:
             self._action_type = {
                 'traffic_link': Edge(graph_name='traffic_graph', poolings=[ConcatPooling]),
                 'communication_path': Path(graph_name='communication_graph',
@@ -1007,17 +1344,17 @@ class ExtendedTrafficEngineeringEnv(TrafficEngineeringEnv, ContinuousEnv):
                                        set_dict_key_name='traffic_link',
                                        set_dict_function=edge_key_from_tuple,
                                        max_len=self.max_len_path,
-                                       poolings=[ConcatPooling])
+                                       poolings=poolings)
             }
-        elif self.path_encoding == 'pooling':
+        else:
             self._action_type = {
-                'traffic_link': Edge(graph_name='traffic_graph'),
+                'traffic_link': Edge(graph_name='traffic_graph', poolings=[ConcatPooling]),
                 'communication_path': Path(graph_name='communication_graph',
-                                       set_dict=self.routing_dict_formatted,
-                                       set_dict_key_name='traffic_link',
-                                       set_dict_function=edge_key_from_tuple,
-                                       max_len=self.max_len_path,
-                                       poolings=[MeanPooling, SumPooling]),
+                                           set_dict=self.routing_dict_formatted,
+                                           set_dict_key_name='traffic_link',
+                                           set_dict_function=edge_key_from_tuple,
+                                           max_len=self.max_len_path,
+                                           poolings=poolings)
             }
 
         # computed to ensure correct normalization
@@ -1086,13 +1423,22 @@ class ExtendedTrafficEngineeringEnv(TrafficEngineeringEnv, ContinuousEnv):
             self.discrete_actions = ["no_action"]
         else:
             self.discrete_actions = []
-        self.action_candidates_reconstruction = False
+        if not self.revisiting:
+            self.action_candidates_reconstruction = True
+        else:
+            self.action_candidates_reconstruction = False
         self.reconstruct_only_changed_nodes = True
         self.action_space_reconstruction_each_step = True
 
     def sample_valid_action(self):
         # 1. Randomly select an edge
-        edge_idx = np.random.randint(0, len(self.traffic_edges))
+        if self.revisiting:
+            edge_idx = np.random.randint(0, len(self.traffic_edges))
+        else:
+            unvisited_edges = [i for i, edge in enumerate(self.traffic_edges) if edge not in self.visited_traffic_edges]
+            if not unvisited_edges:
+                return None
+            edge_idx = np.random.choice(unvisited_edges)
         # 2. Randomly select a routing option for that edge
         routing_options = self.routing_dict[self.traffic_edges[edge_idx]]
         communication_path = routing_options[np.random.randint(0, len(routing_options))]

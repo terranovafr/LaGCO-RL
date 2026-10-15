@@ -4,16 +4,17 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 import random
 from gymnasium import spaces
 import numpy as np
 import itertools
 import networkx as nx
 from utils.features_utils import get_number_nodes, get_number_edges, get_average_node_degree, get_graph_density
-from utils.model import Node, Graph, Function, Attribute
+from utils.model import Node, Graph, Function, Attribute, Object
 from utils.feature_extractors import OneHotEncoding, IdentityEncoding
 from utils.pooling_functions import MeanPooling, SumPooling, MinPooling, MaxPooling
-from utils.encoding_options import ContinuousValue, MultiClassValue
+from utils.encoding_options import ContinuousValue, MultiClassValue, BinaryValue
 from envs.env import DiscreteEnv
 from wrappers.wrapper import ContinuousEnv
 from tqdm import tqdm
@@ -30,6 +31,7 @@ class MaxCutEnv(DiscreteEnv):
                  reward_type="relative",
                  max_sweeps=1000,
                  largest_K_edges=None,
+                 revisiting=False,
                  **kwargs):
 
         super().pre_init(**kwargs)
@@ -39,6 +41,7 @@ class MaxCutEnv(DiscreteEnv):
         self.largest_K_edges = largest_K_edges
         self.max_sweeps = max_sweeps
         self.scenario_size = num_nodes
+        self.revisiting = revisiting
         # Observation: partition assignments + upper-triangular weights
         obs_len = self.num_nodes + (self.num_nodes * (self.num_nodes - 1)) // 2
         self.observation_space = spaces.Dict({
@@ -52,17 +55,52 @@ class MaxCutEnv(DiscreteEnv):
         super().post_init()
         self.reset()
 
+    def is_valid_action(self, action, partition=None):
+        if action not in self.graph.nodes:
+            return False
+        if self.revisiting:
+            return True
+        return not self.graph.nodes[action]["x_dict"]["visited"]
 
-    def is_valid_action(self, action):
-        return action in self.graph.nodes
 
     def build_action_list(self):
-        return [action for action in self.graph.nodes]
+        if not self.revisiting:
+            return [(action, partition) for action in self.graph.nodes for partition in [0, 1]]
+        else:
+            return [action for action in self.graph.nodes]
 
     def build_semantic_action_list(self):
         # return them ordered by degree, so that the agent can learn to assign high degree nodes first
         degree_dict = dict(self.graph.degree())
-        return sorted(self.graph.nodes, key=lambda x: degree_dict[x], reverse=True)
+        if not self.revisiting:
+            return sorted([(action, partition) for action in self.graph.nodes for partition in [0, 1]], key=lambda x: degree_dict[x[0]], reverse=True)
+        else:
+            return sorted(self.graph.nodes, key=lambda x: degree_dict[x], reverse=True)
+
+    def export_graph(self, path):
+        """
+        Export the complete weighted graph as a weighted edge list.
+
+        Format
+        ------
+        # Weighted MaxCut graph
+        # Nodes <n>
+        # Edges <m>
+        u v weight
+        """
+
+        with open(path, "w") as f:
+
+            num_edges = self.num_nodes * (self.num_nodes - 1) // 2
+
+            f.write("# Weighted MaxCut graph\n")
+            f.write(f"# Nodes {self.num_nodes}\n")
+            f.write(f"# Edges {num_edges}\n")
+
+            for i in range(self.num_nodes):
+                for j in range(i + 1, self.num_nodes):
+                    weight = self.weights_matrix[i, j]
+                    f.write(f"{i} {j} {weight}\n")
 
     def _generate_graph(self):
         self.graph = nx.Graph()
@@ -72,7 +110,7 @@ class MaxCutEnv(DiscreteEnv):
         self.weights_matrix += self.weights_matrix.T
 
         for i in range(self.num_nodes):
-            self.graph.add_node(i, x_dict={'partition': 0})  # start all in partition 0
+            self.graph.add_node(i, x_dict={'partition': 0, 'visited': False})  # start all in partition 0
 
         # keep only the top K edges per node if largest_K_edges is set, otherwise keep all edges
         if self.largest_K_edges is None:
@@ -140,16 +178,60 @@ class MaxCutEnv(DiscreteEnv):
                       diff[np.triu_indices(self.num_nodes, 1)])
 
     def reset(self, **kwargs):
+        if self.revisiting:
+            return self.reset_revisiting(**kwargs)
+        else:
+            return self.reset_non_revisiting(**kwargs)
+
+    def reset_non_revisiting(self, **kwargs):
         super().pre_reset()
-        # generate random weighted graph
+
+        # Original initial solution:
+        # all nodes start in partition 0.
         for i in range(self.num_nodes):
-            self.graph.nodes[i]['x_dict']['partition'] = 0
+            self.graph.nodes[i]["x_dict"]["partition"] = 0
+            self.graph.nodes[i]["x_dict"]["visited"] = False
+
         self.assigned_nodes = set()
+
         self.current_cut = 0
         self.prev_cut = 0
+
         self.obs = self._get_obs()
         self.info = {}
+
         super().post_reset()
+
+        return self.obs, {}
+
+    def reset_revisiting(self, **kwargs):
+        super().pre_reset()
+
+        for i in range(self.num_nodes):
+            self.graph.nodes[i]["x_dict"]["partition"] = 0
+            self.graph.nodes[i]["x_dict"]["visited"] = False
+
+        self.assigned_nodes = set()
+
+        # Calculate the cut of the random initial solution
+        partition = np.array([
+            self.graph.nodes[i]["x_dict"]["partition"]
+            for i in range(self.num_nodes)
+        ])
+
+        self.current_cut = self.compute_cut(partition)
+        self.prev_cut = self.current_cut
+
+
+        # Best solution found during this episode
+        self.best_episode_cut = self.current_cut
+        self.best_episode_partition = partition.copy()
+
+        self.obs = self._get_obs()
+        self.info = {}
+
+        super().post_reset()
+
         return self.obs, {}
 
     def _get_obs(self):
@@ -160,7 +242,97 @@ class MaxCutEnv(DiscreteEnv):
         obs = np.concatenate([partitions, weights_flat])
         return {"graph": obs.astype(np.float32)}
 
-    def step(self, node):
+    def step(self, node, partition=None):
+        if self.revisiting:
+            return self.step_revisiting(node)
+        else:
+            return self.step_non_revisiting(node, partition)
+
+    def step_non_revisiting(self, node, partition):
+        node, partition = super().pre_step((node, partition))
+
+        self.reward = 0.0
+        self.info = {}
+
+        if self.invalid_action or self.no_action:
+            self.obs = self._get_obs()
+            super().post_step()
+            return (
+                self.obs,
+                self.reward,
+                self.done,
+                self.truncated,
+                self.info,
+            )
+
+        # Original transition logic
+        new_part = partition
+        old_part = self.graph.nodes[node]["x_dict"]["partition"]
+        if new_part == old_part:
+            # No change in partition, no reward
+            self.assigned_nodes.add(node)
+            self.graph.nodes[node]["x_dict"]["visited"] = True
+            all_nodes_assigned = len(self.assigned_nodes) == self.num_nodes
+
+            self.done = all_nodes_assigned
+            if self.terminate_at_approximate_best:
+                self.done |= (
+                        self.current_cut >= self.best_cut
+                )
+            self.obs = self._get_obs()
+            super().post_step()
+            return (
+                self.obs,
+                self.reward,
+                self.done,
+                self.truncated,
+                self.info,
+            )
+
+        delta = self._compute_flip_gain(node, old_part)
+
+        self.graph.nodes[node]["x_dict"]["partition"] = new_part
+        self.graph.nodes[node]["x_dict"]["visited"] = True
+
+        # Non-revisiting: node is now consumed
+        self.assigned_nodes.add(node)
+
+        self.prev_cut = self.current_cut
+        self.current_cut += delta
+
+        # Original reward logic
+        if self.reward_type == "relative":
+            denom = max(self.best_cut - self.worst_cut, 1e-8)
+            self.reward = delta / denom
+        else:
+            self.reward = delta
+
+        # Non-revisiting termination:
+        # all nodes have been assigned/flipped once.
+        self.done = (
+                len(self.assigned_nodes) >= self.num_nodes
+        )
+
+        if self.terminate_at_approximate_best:
+            self.done |= (
+                    self.current_cut >= self.best_cut
+            )
+
+
+
+        self.obs = self._get_obs()
+
+        super().post_step()
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info,
+        )
+
+    def step_revisiting(self, node):
         node = super().pre_step(node)
 
         self.reward = 0.0
@@ -169,34 +341,59 @@ class MaxCutEnv(DiscreteEnv):
         if self.invalid_action or self.no_action:
             self.obs = self._get_obs()
             super().post_step()
-            return self.obs, self.reward, self.done, self.truncated, self.info
+            return (
+                self.obs,
+                self.reward,
+                self.done,
+                self.truncated,
+                self.info,
+            )
 
-        # flip the partition of the selected node and compute the change in cut value
+        # Same transition as original MaxCut
         old_part = self.graph.nodes[node]["x_dict"]["partition"]
         new_part = 1 - old_part
 
         delta = self._compute_flip_gain(node, old_part)
 
         self.graph.nodes[node]["x_dict"]["partition"] = new_part
-        self.assigned_nodes.add(node)
+        self.graph.nodes[node]["x_dict"]["visited"] = True
 
         self.prev_cut = self.current_cut
         self.current_cut += delta
 
+        # Same local transition reward
         if self.reward_type == "relative":
             denom = max(self.best_cut - self.worst_cut, 1e-8)
             self.reward = delta / denom
         else:
             self.reward = delta
 
+        # Track best solution separately
+        if self.current_cut > self.best_episode_cut:
+            self.best_episode_cut = self.current_cut
+
+            self.best_episode_partition = np.array([
+                self.graph.nodes[i]["x_dict"]["partition"]
+                for i in range(self.num_nodes)
+            ])
+
+        # Revisiting termination = fixed search horizon
         if self.terminate_at_approximate_best:
-            self.done = (self.current_cut >= self.best_cut)
-        else:
-            self.done = False
+            self.done |= (
+                    self.current_cut >= self.best_cut
+            )
 
         self.obs = self._get_obs()
+
         super().post_step()
-        return self.obs, self.reward, self.done, self.truncated, self.info
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info,
+        )
 
     def _compute_flip_gain(self, node, old_part):
         # easy to compute incrementally: only edges connected to the flipped node can change their crossing status
@@ -232,10 +429,25 @@ class MaxCutEnv(DiscreteEnv):
         self.reward_type = config.get('reward_type', self.reward_type)
         old_largest_K_edges = self.largest_K_edges
         self.largest_K_edges = config.get('largest_K_edges', self.largest_K_edges)
+        self.revisiting = config.get('revisiting', self.revisiting if hasattr(self, 'revisiting') else False)
         if self.largest_K_edges != old_largest_K_edges:
             # need to regenerate the graph with the new sparsity pattern
-            self._generate_graph()
-            self.best_cut, self.worst_cut = self.estimate_bounds(self.max_sweeps)
+            # clear all edges
+            self.graph.remove_edges_from(list(self.graph.edges))
+            for i in range(self.num_nodes):
+                topk = np.argsort(self.weights_matrix[i])[::-1]
+                topk = [j for j in topk if j != i][:self.largest_K_edges]
+
+                for j in topk:
+                    if not self.graph.has_edge(i, j):
+                        self.graph.add_edge(
+                            i, j,
+                            edge_attr_dict={'weight': self.weights_matrix[i, j]}
+                        )
+        for node in self.graph.nodes:
+            self.graph.nodes[node]["x_dict"]["visited"] = False
+        self.action_list = self.build_action_list()
+        self.semantic_action_list = self.build_semantic_action_list()
         self.reset()
 
 class ExtendedMaxCutEnv(MaxCutEnv, ContinuousEnv):
@@ -251,16 +463,28 @@ class ExtendedMaxCutEnv(MaxCutEnv, ContinuousEnv):
             'average_node_degree': Function(func=get_average_node_degree, graph_name='graph'),
             'graph_density': Function(func=get_graph_density, graph_name='graph'),
         }
-        self._action_type = {
-            'node': Node(graph_name='graph')
-        }
-
+        if self.revisiting:
+            self._action_type = {
+                'node': Node(graph_name='graph')
+            }
+        else:
+            self.partitions = [0, 1]
+            self._action_type = {
+                'node': Node(graph_name='graph', spec={"visited": False}),
+                'partition': Object(name='partition', set=self.partitions,
+                                       feature_extractor=OneHotEncoding,
+                                       feature_extractor_args={'set': self.partitions},
+                                       embedding_size=len(self.partitions))
+            }
         self._node_attributes = {
             'partition': Attribute(feature_extractor=OneHotEncoding,
                                    feature_extractor_args={'set': [0, 1]},
                                    encoding=MultiClassValue(num_classes=2),
                                    embedding_size=2,
-                                   graph_name='graph')
+                                   graph_name='graph'),
+            'visited': Attribute(encoding=BinaryValue(),
+                                embedding_size=1,
+                                graph_name='graph')
         }
         self._edge_attributes = {
             'weight': Attribute(feature_extractor=IdentityEncoding,
@@ -281,12 +505,18 @@ class ExtendedMaxCutEnv(MaxCutEnv, ContinuousEnv):
         self.reconstruct_only_changed_nodes = False
 
     def sample_valid_action(self):
-        # Randomly select unassigned node and partition
-        node_list = [i for i in range(self.num_nodes) if i not in self.assigned_nodes]
-        if len(node_list) == 0:
-            node_list = [i for i in range(self.num_nodes)]
-        node = random.choice(node_list)
-        return node
+        if self.revisiting:
+            node_list = list(self.graph.nodes)
+        else:
+            node_list = [
+                i for i in self.graph.nodes
+                if not self.graph.nodes[i]["x_dict"]["visited"]
+            ]
+
+        if not node_list:
+            return None
+
+        return random.choice(node_list)
 
     def get_graphs(self):
         return {'graph': self.graph}

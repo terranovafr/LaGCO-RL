@@ -164,7 +164,7 @@ def parse_option(config, envs, logger, verbose):
 
             if config['option'] == "agent_performances":
                 # Compute average performances and save them in a CSV file, also save a summary YAML file
-                (df, metrics) = calculate_average_performances(
+                (df, metrics), certainty_stats = calculate_average_performances(
                     model, envs, config['seeds_test'], proto_knn, num_envs=config['num_envs'], num_episodes=config['num_episodes_per_checkpoint'], avoid_random=not config['add_random'], logger=logger, verbose=verbose)
 
                 df.to_csv(os.path.join(save_folder, f"average_performances_{checkpoint_short_name}_{config['num_episodes_per_checkpoint']}.csv"), index=False)
@@ -180,6 +180,41 @@ def parse_option(config, envs, logger, verbose):
                         all_outcomes[checkpoint_short_name][metric] = metrics[metric]
                     else:
                         all_outcomes[checkpoint_short_name][metric].extend(metrics[metric])
+
+                # save all certainty stats and their aggregation
+                with open(os.path.join(save_folder, f"certainty_stats_{checkpoint_short_name}_{config['num_episodes_per_checkpoint']}.yaml"), 'w', newline='') as file:
+                    yaml.dump(certainty_stats, file)
+                # save mean and std of certainty stats
+                certainty_stats_summary = {}
+
+                keys = certainty_stats[0].keys()
+
+                for key in keys:
+
+                    if key == "raw":
+                        continue
+
+                    values = [
+                        episode[key]
+                        for episode in certainty_stats
+                        if episode[key] is not None
+                    ]
+
+                    if len(values) == 0:
+                        continue
+
+                    values = np.asarray(values)
+
+                    certainty_stats_summary[key] = {
+                        "mean": np.mean(values, axis=0).tolist(),
+                        "std": np.std(values, axis=0, ddof=1).tolist()
+                        if len(values) > 1
+                        else np.zeros_like(values[0]).tolist(),
+                        "max": np.max(values, axis=0).tolist(),
+                        "min": np.min(values, axis=0).tolist(),
+                    }
+                with open(os.path.join(save_folder, f"certainty_stats_summary_{checkpoint_short_name}_{config['num_episodes_per_checkpoint']}.yaml"), 'w', newline='') as file:
+                    yaml.dump(certainty_stats_summary, file)
             elif config['option'] == "action_time":
                 # Compute average action time and episode time and save them in YAML files
                 action_times, episode_times = calculate_average_action_time(model, envs, config, proto_knn,
@@ -316,7 +351,7 @@ def load_test_envs(run_folder, args, train_config, test_config, logs_folder, log
     # map to classes after saving the configuration
     if args.load_custom_test_envs or args.load_custom_envs or args.load_custom_val_envs or args.load_custom_train_envs: # reload right elements from the custom folder
         # load in a temporary folder that will be then eliminated to not overload file system
-        tmp_folder = os.path.join(script_dir, "tmp", datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+        tmp_folder = os.path.join(script_dir, "tmp", datetime.now().strftime("%Y%m%d%H%M%S"))
         if not os.path.exists(tmp_folder):
             os.makedirs(tmp_folder)
         for folder in tqdm(os.listdir(envs_folder), desc="Loading environments..."):
@@ -327,12 +362,14 @@ def load_test_envs(run_folder, args, train_config, test_config, logs_folder, log
                 train_config.pop('verbose', None)
 
                 environment.update_max_steps(test_config['max_steps_overall'], test_config['max_steps_coefficient'])
+                environment.update_initialize_random_revisiting(test_config['initialize_random_revisiting'])
                 if args.algorithm_type == "projection" or args.algorithm_type == "iterative":
                     environment.update_spec()
                     if args.proto_knn:
                         train_config['knn'] = args.proto_knn
                     environment = AgentTrainingWrapper(env=environment,
                                                        env_name=args.environment,
+                                                       logs_folder=logs_folder,
                                                        gnn_models=encoders, **train_config)
                 # discrete has nothing to do
                 with open(os.path.join(tmp_folder, f"{folder}.pkl"), 'wb') as f:
@@ -568,7 +605,7 @@ def main():
 
     num_envs = 1
     if envs_folder is not None:
-        num_envs = len([f for f in os.listdir(envs_folder) if os.path.isdir(os.path.join(envs_folder, f)) and f.endswith(".pkl")])
+        num_envs = len([f for f in os.listdir(envs_folder) if os.path.isdir(os.path.join(envs_folder, f)) and f != "difusco"])
         # filter based on split.yaml
         if args.load_default_test_envs or args.load_default_val_envs or args.load_default_train_envs:
             with open(os.path.join(args.logs_folder, "split.yaml"), 'r') as file:
@@ -603,6 +640,8 @@ def main():
     test_config.update({"seeds_test": seed_test})
     test_config.update({"num_episodes_per_env": num_episodes_per_env})
     test_config.update({"num_envs": num_envs})
+    if args.environment in test_config:
+        test_config.update(test_config[args.environment])
     set_seeds(seed_test[0])
 
     run_folder = os.path.join(args.logs_folder)
@@ -617,10 +656,10 @@ def main():
 
     test_envs, envs_folder = load_test_envs(run_folder, args, train_config, test_config, args.logs_folder, logger=logger)
     _ = parse_option(test_run_config, test_envs, logger, args.verbose)
-    # runs_outcomes.append(outcomes) # Potentially use runs_outcomes to average the outcomes in the future
     if args.load_custom_test_envs or args.load_custom_envs or args.load_custom_val_envs or args.load_custom_train_envs:
         remove_folder_and_files(envs_folder)
 
 
 if __name__ == "__main__":
     main()
+

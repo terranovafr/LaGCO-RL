@@ -4,6 +4,12 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+'''
+    assess_gae_ablation_unsupervised.py
+    This script automates the process of conducting an ablation study for a Graph Autoencoder (GAE) model. It generates random environments, trains the GAE model with and without specific loss terms, and tests the performance of the trained models.
+    The performance is measured as impact on the unsupervised task.
+'''
+
 import argparse
 import copy
 import sys
@@ -110,13 +116,51 @@ def main():
     # ============================================================
     # 5. ABLATION LOOP: set each weight to 0, train/test, restore
     # ============================================================
-    if not args.skip_all_maskings:
-        for weight_name, original_value in loss_weights.items():
-            print(f"\n===== ABLATION: SETTING {weight_name} TO 0 FROM {original_value} =====\n", flush=True)
-            original_value_copy = copy.deepcopy(original_value)
-            train_config['weights']['default'][weight_name] = 0
-            save_yaml(train_config, os.path.join(script_dir, "..", "gae", "config"), "train_config.yaml")
+    ablations = [
+        {
+            "name": "adj_weight",
+            "weights": [
+                "adj_weight",
+            ],
+        },
+        {
+            "name": "edge_features",
+            "weights": [
+                "edge_feature_vector_binary_cat_weight",
+                "edge_feature_vector_multi_cat_weight",
+                "edge_feature_vector_cont_weight",
+                "edge_feature_vector_ranking_weight",
+            ],
+        },
+        {
+            "name": "node_features",
+            "weights": [
+                "node_feature_vector_binary_cat_weight",
+                "node_feature_vector_multi_cat_weight",
+                "node_feature_vector_cont_weight",
+                "node_feature_vector_ranking_weight",
+            ],
+        },
+    ]
 
+    if not args.skip_all_maskings:
+        for ablation in ablations:
+            print(f"\n===== ABLATING {ablation['name']} =====\n")
+
+            originals = {}
+
+            # Zero all weights in this group
+            for weight_name in ablation["weights"]:
+                originals[weight_name] = copy.deepcopy(
+                    train_config["weights"]["default"][weight_name]
+                )
+                train_config["weights"]["default"][weight_name] = 0
+
+            save_yaml(
+                train_config,
+                os.path.join(script_dir, "..", "gae", "config"),
+                "train_config.yaml",
+            )
             # Train
             if not args.skip_training:
                 for env in args.environment:
@@ -125,8 +169,8 @@ def main():
                         "python3", os.path.join(script_dir, "..", "gae", "train_gae.py"),
                         "-e", env,
                         "-ti", str(args.train_iterations),
-                        "--name", f"{env}_ablation_{weight_name}",
-                        "--force_saving",
+                        "--name", f"{env}_ablation_{ablation['name']}",
+                        "--force_saving"
                     ]
                     if args.validation:
                         cmd.append("--validation")
@@ -153,8 +197,9 @@ def main():
             wait_all(test_procs)
 
             # Restore weight
-            print(f"\n===== RESTORING {weight_name} TO {original_value_copy} =====\n", flush=True)
-            train_config['weights']['default'][weight_name] = original_value_copy
+            # ----- restore -----
+            for weight_name, value in originals.items():
+                train_config["weights"]["default"][weight_name] = value
             save_yaml(train_config, os.path.join("..", "gae", "config"), "train_config.yaml")
 
     print("\n✅ Ablation study completed successfully")

@@ -1,6 +1,7 @@
 # Reproducibility Guide
 
-This document provides step-by-step instructions to reproduce all experiments and results presented in our paper. The process includes scenario generation, optional hyperparameter optimization, training, evaluation, and plotting.
+This document provides step-by-step instructions to reproduce all experiments and results presented in the main body of our paper. The process includes scenario generation, optional hyperparameter optimization, training, evaluation, and plotting.
+Additional experiments presented in the Appendix are supported by scripts present in the `experiments/` and `plotting/` folders.
 
 ---
 
@@ -56,7 +57,8 @@ python3 random_generator.py \
     --test_pct 0
 ```
 ---
-Maximum Sweeps (-ms) controls the number of heuristic iterations used to approximate optimal solutions.
+This document provides step-by-step instructions to reproduce all experiments and results presented in the main body of our paper. The process includes scenario generation, optional hyperparameter optimization, training, evaluation, and plotting.
+Additional experiments presented in the Appendix are supported by scripts present in the `experiments/` and `plotting/` folders.
 - Higher values → better normalization of performance scores
 - Lower values → faster generation
 Change hyper-parameters accordingly to customize this stage (e.g., faster generation with lower number of sweeps and instances).
@@ -195,6 +197,7 @@ Notes:
   - maskable_ppo for discrete variants relying on masking
   - idqn for iterative variants
 - All parameters can be customized to more accurate experiments with larger number of runs per strategy or any desired customization
+- The revisiting parameter should be changed according to which version of the environment is being used (revisiting or non-revisiting). The default is revisiting=True and it is used for MVC, MaxCut, OSPF Engineering, Placement, Traffic Engineering.
 
 ---
 

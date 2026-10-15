@@ -4,6 +4,13 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
+
+'''
+    assess_gae_generalization.py
+    This script runs a series of experiments to assess the generalization capabilities of the GAE across different environments.
+'''
+
 import argparse
 import os
 import sys

@@ -4,6 +4,7 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 """
     gae_utils.py
     This file contains the utility functions for the Graph Autoencoder model training and validation.
@@ -188,7 +189,7 @@ def compute_loss(model, graph_name, data, loss_weighting_object, loss_combinatio
         }
         # Combine all losses with proper weights
         total_loss, feature_loss, edge_feature_loss = loss_fn(current_losses, weights)
-
+    # print all weights and all losses values and final total loss
     return total_loss, adj_loss, feature_loss, edge_feature_loss, binary_cat_loss, multi_cat_loss, cont_loss, ranking_loss_value, edge_binary_loss, edge_multi_cat_loss, edge_continuous_loss, edge_ranking_loss, kl_loss
 
 

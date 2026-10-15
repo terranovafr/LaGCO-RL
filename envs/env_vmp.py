@@ -4,9 +4,12 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 import copy
 import networkx as nx
 from gymnasium.spaces import Box, Dict
+from tqdm import tqdm
+import numpy as np
 import random
 from utils.features_utils import get_number_nodes, get_number_edges, get_average_node_degree, get_graph_density
 from utils.model import Node, Graph, Attribute, ActionSpace, Function
@@ -17,7 +20,7 @@ from wrappers.wrapper import ContinuousEnv
 from utils.log_utils import graph_nodes_to_text, graph_edges_to_text
 from utils.math_utils import sample_range_dict, min_max_normalize
 from envs.env import DiscreteEnv
-import numpy as np
+
 
 class VMPlacementEnv(DiscreteEnv):
     """
@@ -25,49 +28,50 @@ class VMPlacementEnv(DiscreteEnv):
     """
 
     def __init__(
-        self,
-        n_pms: int = 8,
-        n_vms: int = 20,
-        n_tenants: int = 3,
-        pm_capacity_mips_min: int = 1000,
-        pm_capacity_mips_max: int = 5000,
-        pm_capacity_memory_min: int = 16,
-        pm_capacity_memory_max: int = 128,
-        pm_capacity_storage_min: int = 100,
-        pm_capacity_storage_max: int = 5000,
-        pm_capacity_pe_min: int = 4,
-        pm_capacity_pe_max: int = 128,
-        vm_demand_mips_min: int = 250,
-        vm_demand_mips_max: int = 2000,
-        vm_demand_memory_min: int = 2,
-        vm_demand_memory_max: int = 64,
-        vm_demand_storage_min: int = 10,
-        vm_demand_storage_max: int = 1000,
-        vm_demand_pe_min: int = 1,
-        vm_demand_pe_max: int = 16,
-        min_traffic: float = 1.0,
-        max_traffic: float = 10.0,
-        traffic_density: float = 0.2,
-        latency_min: float = 1.0,
-        latency_max: float = 20.0,
-        p_idle: float = 60.0,
-        p_peak: float = 200.0,
-        same_pm_penalty_sum: float = -1.0,
-        util_coefficient: float = 1,
-        packing_coefficient: float= 1,
-        power_coefficient: float = 1,
-        latency_coefficient: float = 1,
-        movement_coefficient: float= -0.05,
-        add_movement_cost: bool = False,
-        extra_edge_probability: float = 0.1,
-        vm_vuln_prob_min: float = 0.01,
-        vm_vuln_prob_max: float = 1,
-        pm_escape_prob_min: float = 0.01,
-        pm_escape_prob_max: float = 0.33,
-        security_coefficient: float = 1.0,
-        max_sweeps: int = 2500,
-        invalid_action_penalty_sum: float = -10,
-        **kwargs
+            self,
+            n_pms: int = 8,
+            n_vms: int = 20,
+            n_tenants: int = 3,
+            pm_capacity_mips_min: int = 1000,
+            pm_capacity_mips_max: int = 5000,
+            pm_capacity_memory_min: int = 16,
+            pm_capacity_memory_max: int = 128,
+            pm_capacity_storage_min: int = 100,
+            pm_capacity_storage_max: int = 5000,
+            pm_capacity_pe_min: int = 4,
+            pm_capacity_pe_max: int = 128,
+            vm_demand_mips_min: int = 250,
+            vm_demand_mips_max: int = 2000,
+            vm_demand_memory_min: int = 2,
+            vm_demand_memory_max: int = 64,
+            vm_demand_storage_min: int = 10,
+            vm_demand_storage_max: int = 1000,
+            vm_demand_pe_min: int = 1,
+            vm_demand_pe_max: int = 16,
+            min_traffic: float = 1.0,
+            max_traffic: float = 10.0,
+            traffic_density: float = 0.2,
+            latency_min: float = 1.0,
+            latency_max: float = 20.0,
+            p_idle: float = 60.0,
+            p_peak: float = 200.0,
+            same_pm_penalty_sum: float = -1.0,
+            util_coefficient: float = 1,
+            packing_coefficient: float = 1,
+            power_coefficient: float = 1,
+            latency_coefficient: float = 1,
+            movement_coefficient: float = -0.05,
+            add_movement_cost: bool = False,
+            extra_edge_probability: float = 0.1,
+            vm_vuln_prob_min: float = 0.01,
+            vm_vuln_prob_max: float = 1,
+            pm_escape_prob_min: float = 0.01,
+            pm_escape_prob_max: float = 0.33,
+            security_coefficient: float = 1.0,
+            max_sweeps: int = 2500,
+            invalid_action_penalty_sum: float = -10,
+            revisiting: bool = False,
+            **kwargs
     ):
         super().pre_init(**kwargs)
         self.n_pms = n_pms
@@ -90,6 +94,7 @@ class VMPlacementEnv(DiscreteEnv):
         self.pm_escape_prob_max = pm_escape_prob_max
         self.max_sweeps = max_sweeps
         self.invalid_action_penalty_sum = invalid_action_penalty_sum
+        self.revisiting = revisiting
 
         self.pm_capacity_ranges = {
             "pe": (pm_capacity_pe_min, pm_capacity_pe_max),
@@ -117,8 +122,8 @@ class VMPlacementEnv(DiscreteEnv):
         self.p_peak = p_peak
 
         # Graphs
-        self.alloc_graph = nx.Graph()   # VM-PM allocation graph
-        self.traffic_graph = nx.Graph() # VM-VM traffic graph (static)
+        self.alloc_graph = nx.Graph()  # VM-PM allocation graph
+        self.traffic_graph = nx.Graph()  # VM-VM traffic graph (static)
 
         # Gym API
         self.pm_feat_dim = 8
@@ -151,6 +156,7 @@ class VMPlacementEnv(DiscreteEnv):
             for key in vm_feature:
                 self.alloc_graph.nodes[f"VM_{vm_id}"]["x_dict"][key] = vm_feature[key]
                 self.traffic_graph.nodes[f"VM_{vm_id}"]["x_dict"][key] = vm_feature[key]
+            self.alloc_graph.nodes[f"VM_{vm_id}"]["x_dict"]["visited"] = False
 
         for pm_id in range(self.n_pms):
             _, pm_feature = self._pm_features(f"PM_{pm_id}")
@@ -182,6 +188,14 @@ class VMPlacementEnv(DiscreteEnv):
         self.movement_coefficient = config.get("movement_coefficient", self.movement_coefficient)
         self.invalid_action_penalty_sum = config.get("invalid_action_penalty_sum", self.invalid_action_penalty_sum)
         self.add_movement_cost = config.get("add_movement_cost", self.add_movement_cost)
+        self.revisiting = config.get("revisiting", self.revisiting if hasattr(self, "revisiting") else False)
+
+        # update visited flag to all False
+        for vm_id in range(self.n_vms):
+            self.alloc_graph.nodes[f"VM_{vm_id}"]["x_dict"]["visited"] = False
+        self.action_list = self.build_action_list()
+        self.semantic_action_list = self.build_action_list()
+        self.post_init()
         # no need to recompute action space
 
     def _generate_datacenter(self):
@@ -193,10 +207,13 @@ class VMPlacementEnv(DiscreteEnv):
 
             self.alloc_graph.add_node(
                 f"PM_{i}",
-                x_dict={"type": "PM", "cap": caps, "used": {k: 0 for k in caps}, "power": self.p_idle, "escape_prob": escape_prob},
+                x_dict={"type": "PM", "cap": caps, "used": {k: 0 for k in caps}, "power": self.p_idle,
+                        "escape_prob": escape_prob},
             )
         # Random symmetric latencies
-        self.latency_graph, self.latency_dict = self._build_connected_latency_graph(self.n_pms, self.latency_min, self.latency_max, extra_edge_prob=self.extra_edge_probability)
+        self.latency_graph, self.latency_dict = self._build_connected_latency_graph(self.n_pms, self.latency_min,
+                                                                                    self.latency_max,
+                                                                                    extra_edge_prob=self.extra_edge_probability)
 
     def _build_connected_latency_graph(self, n_pms, latency_min=1, latency_max=20, extra_edge_prob=0.1):
         # Step 1: fully-defined latency matrix (NOT edges yet)
@@ -227,7 +244,8 @@ class VMPlacementEnv(DiscreteEnv):
 
         fw = nx.floyd_warshall(G, weight="latency")
         latency_dict = {u: dict(v) for u, v in fw.items()}
-        self.max_latency_movement_cost = max(latency_dict[u][v] for u in latency_dict for v in latency_dict[u] if u != v)
+        self.max_latency_movement_cost = max(
+            latency_dict[u][v] for u in latency_dict for v in latency_dict[u] if u != v)
         for node in G.nodes:
             G.nodes[node]['x_dict'] = self.alloc_graph.nodes[node]['x_dict']
         return G, latency_dict
@@ -241,8 +259,10 @@ class VMPlacementEnv(DiscreteEnv):
             vuln_prob = random.uniform(self.vm_vuln_prob_min, self.vm_vuln_prob_max)
 
             # Add VM node to both graphs
-            self.alloc_graph.add_node(f"VM_{i}", x_dict={"type": "VM", "dem": dem, "tenant": tenant, "vuln_prob": vuln_prob})
-            self.traffic_graph.add_node(f"VM_{i}", x_dict={"type": "VM", "dem": dem, "tenant": tenant, "vuln_prob": vuln_prob})
+            self.alloc_graph.add_node(f"VM_{i}",
+                                      x_dict={"type": "VM", "dem": dem, "tenant": tenant, "vuln_prob": vuln_prob})
+            self.traffic_graph.add_node(f"VM_{i}",
+                                        x_dict={"type": "VM", "dem": dem, "tenant": tenant, "vuln_prob": vuln_prob})
 
         # Generate traffic edges in traffic graph
         for i in range(self.n_vms):
@@ -266,33 +286,13 @@ class VMPlacementEnv(DiscreteEnv):
             vms = tenant_to_vms[largest_tenant]
             if len(vms) >= 2:
                 v1, v2 = random.sample(vms, 2)
-                self.traffic_graph.add_edge(f"VM_{v1}", f"VM_{v2}", edge_attr_dict={"traffic": random.uniform(self.min_traffic, self.max_traffic)})
+                self.traffic_graph.add_edge(f"VM_{v1}", f"VM_{v2}", edge_attr_dict={
+                    "traffic": random.uniform(self.min_traffic, self.max_traffic)})
             else:
                 # If even the largest tenant has only 1 VM, just connect two random VMs
                 v1, v2 = random.sample(range(self.n_vms), 2)
-                self.traffic_graph.add_edge(f"VM_{v1}", f"VM_{v2}", edge_attr_dict={"traffic": random.uniform(self.min_traffic, self.max_traffic)})
-
-    def _random_allocation(self):
-        # Clear existing allocations
-        for i in range(self.n_pms):
-            self.alloc_graph.nodes[f"PM_{i}"]["x_dict"]["used"] = {k: 0 for k in self.pm_capacity_ranges}
-            self.alloc_graph.nodes[f"PM_{i}"]["x_dict"]["power"] = self.p_idle
-        self.alloc_graph.remove_edges_from(list(self.alloc_graph.edges()))
-
-        # shuffle VM indices to randomize placement order
-        vm_indices = list(range(self.n_vms))
-        random.shuffle(vm_indices)
-
-        for vm_idx in vm_indices:
-            placed = False
-            for _ in range(self.n_pms):
-                pm_idx = random.randrange(self.n_pms)
-                if self.is_valid_action(f"VM_{vm_idx}", f"PM_{pm_idx}"):
-                    self._place_vm(f"VM_{vm_idx}", f"PM_{pm_idx}")
-                    placed = True
-                    break
-            if not placed:
-                raise RuntimeError(f"Could not place VM_{vm_idx} in initial allocation.")
+                self.traffic_graph.add_edge(f"VM_{v1}", f"VM_{v2}", edge_attr_dict={
+                    "traffic": random.uniform(self.min_traffic, self.max_traffic)})
 
     def _encode_allocation(self):
         # Returns a tuple of PM indices indexed by VM index
@@ -322,11 +322,9 @@ class VMPlacementEnv(DiscreteEnv):
                 raise RuntimeError("Invalid allocation encountered")
             self._place_vm(f"VM_{vm_idx}", f"PM_{pm_idx}")
 
-
-
     def _initialize_empirical_worst_allocation(self, max_sweeps=500):
         # Heuristic-driven search to find a diverse set of allocations that span a wide range of metric values, including near-worst cases.
-        import numpy as np
+
         metric_names = [
             "avg_util",
             "packing_efficiency",
@@ -347,9 +345,7 @@ class VMPlacementEnv(DiscreteEnv):
         top_k = 3
         candidate_trials = 6
 
-        from tqdm import tqdm
-        import numpy as np
-        import random
+
 
         def reset_empty_allocation():
             for i in range(self.n_pms):
@@ -572,9 +568,12 @@ class VMPlacementEnv(DiscreteEnv):
         return None
 
     def is_valid_action(self, vm_idx, pm_idx) -> bool:
-        # Check if placing VM on PM would violate capacity constraints
         vm_idx = f"VM_{vm_idx}" if isinstance(vm_idx, int) else vm_idx
         pm_idx = f"PM_{pm_idx}" if isinstance(pm_idx, int) else pm_idx
+        # Check if placing VM on PM would violate capacity constraints
+        if not self.revisiting:
+            if self.alloc_graph.nodes[vm_idx]["x_dict"].get("visited", False):
+                return False
         dem = self.alloc_graph.nodes[vm_idx]["x_dict"]["dem"]
         used = self.alloc_graph.nodes[pm_idx]["x_dict"]["used"]
         cap = self.alloc_graph.nodes[pm_idx]["x_dict"]["cap"]
@@ -624,18 +623,6 @@ class VMPlacementEnv(DiscreteEnv):
         avg_latency = np.mean([self.latency_dict[idx][f"PM_{j}"] for j in range(self.n_pms) if f"PM_{j}" != idx])
 
         features = {
-            'pe_norm_ratio': (cap["pe"] - self.pm_capacity_ranges["pe"][0]) / (self.pm_capacity_ranges["pe"][1] - self.pm_capacity_ranges["pe"][0]),
-            'mips_norm_ratio': (cap["mips"] - self.pm_capacity_ranges["mips"][0]) / (self.pm_capacity_ranges["mips"][1] - self.pm_capacity_ranges["mips"][0]),
-            'ram_norm_ratio': (cap["ram"] - self.pm_capacity_ranges["ram"][0]) / (self.pm_capacity_ranges["ram"][1] - self.pm_capacity_ranges["ram"][0]),
-            'storage_norm_ratio': (cap["storage"] - self.pm_capacity_ranges["storage"][0]) / (self.pm_capacity_ranges["storage"][1] - self.pm_capacity_ranges["storage"][0]),
-            'pe_ratio': used["pe"]/cap["pe"],
-            'mips_ratio': used["mips"]/cap["mips"],
-            'ram_ratio': used["ram"]/cap["ram"],
-            'storage_ratio': used["storage"]/cap["storage"],
-            'power_ratio': power/self.p_peak,
-            'avg_latency': avg_latency/self.latency_max,
-        }
-        graph_features = {
             'pe_norm_ratio': (cap["pe"] - self.pm_capacity_ranges["pe"][0]) / (
                         self.pm_capacity_ranges["pe"][1] - self.pm_capacity_ranges["pe"][0]),
             'mips_norm_ratio': (cap["mips"] - self.pm_capacity_ranges["mips"][0]) / (
@@ -644,6 +631,22 @@ class VMPlacementEnv(DiscreteEnv):
                         self.pm_capacity_ranges["ram"][1] - self.pm_capacity_ranges["ram"][0]),
             'storage_norm_ratio': (cap["storage"] - self.pm_capacity_ranges["storage"][0]) / (
                         self.pm_capacity_ranges["storage"][1] - self.pm_capacity_ranges["storage"][0]),
+            'pe_ratio': used["pe"] / cap["pe"],
+            'mips_ratio': used["mips"] / cap["mips"],
+            'ram_ratio': used["ram"] / cap["ram"],
+            'storage_ratio': used["storage"] / cap["storage"],
+            'power_ratio': power / self.p_peak,
+            'avg_latency': avg_latency / self.latency_max,
+        }
+        graph_features = {
+            'pe_norm_ratio': (cap["pe"] - self.pm_capacity_ranges["pe"][0]) / (
+                    self.pm_capacity_ranges["pe"][1] - self.pm_capacity_ranges["pe"][0]),
+            'mips_norm_ratio': (cap["mips"] - self.pm_capacity_ranges["mips"][0]) / (
+                    self.pm_capacity_ranges["mips"][1] - self.pm_capacity_ranges["mips"][0]),
+            'ram_norm_ratio': (cap["ram"] - self.pm_capacity_ranges["ram"][0]) / (
+                    self.pm_capacity_ranges["ram"][1] - self.pm_capacity_ranges["ram"][0]),
+            'storage_norm_ratio': (cap["storage"] - self.pm_capacity_ranges["storage"][0]) / (
+                    self.pm_capacity_ranges["storage"][1] - self.pm_capacity_ranges["storage"][0]),
             'pe_ratio': used["pe"] / cap["pe"],
             'mips_ratio': used["mips"] / cap["mips"],
             'ram_ratio': used["ram"] / cap["ram"],
@@ -660,16 +663,8 @@ class VMPlacementEnv(DiscreteEnv):
         pm_self = self._get_pm_of_vm(idx)
         colocated_ratio = sum(1 for nbr in self.alloc_graph.neighbors(idx)
                               if nbr.startswith("VM_") and
-                              self._get_pm_of_vm(nbr) == pm_self) / max(len(list(self.alloc_graph.neighbors(idx))),1)
+                              self._get_pm_of_vm(nbr) == pm_self) / max(len(list(self.alloc_graph.neighbors(idx))), 1)
         features = {
-            'pe_norm_ratio': (dem["pe"] - self.vm_demand_ranges["pe"][0]) / (self.vm_demand_ranges["pe"][1] - self.vm_demand_ranges["pe"][0]),
-            'mips_norm_ratio': (dem["mips"] - self.vm_demand_ranges["mips"][0]) / (self.vm_demand_ranges["mips"][1] - self.vm_demand_ranges["mips"][0]),
-            'ram_norm_ratio': (dem["ram"] - self.vm_demand_ranges["ram"][0]) / (self.vm_demand_ranges["ram"][1] - self.vm_demand_ranges["ram"][0]),
-            'storage_norm_ratio': (dem["storage"] - self.vm_demand_ranges["storage"][0]) / (self.vm_demand_ranges["storage"][1] - self.vm_demand_ranges["storage"][0]),
-            'total_traffic': total_traffic,
-            'colocated_ratio': colocated_ratio,
-        }
-        graph_features = {
             'pe_norm_ratio': (dem["pe"] - self.vm_demand_ranges["pe"][0]) / (
                         self.vm_demand_ranges["pe"][1] - self.vm_demand_ranges["pe"][0]),
             'mips_norm_ratio': (dem["mips"] - self.vm_demand_ranges["mips"][0]) / (
@@ -678,6 +673,19 @@ class VMPlacementEnv(DiscreteEnv):
                         self.vm_demand_ranges["ram"][1] - self.vm_demand_ranges["ram"][0]),
             'storage_norm_ratio': (dem["storage"] - self.vm_demand_ranges["storage"][0]) / (
                         self.vm_demand_ranges["storage"][1] - self.vm_demand_ranges["storage"][0]),
+            'total_traffic': total_traffic,
+            'colocated_ratio': colocated_ratio,
+            'visited': int(self.alloc_graph.nodes[idx]["x_dict"].get("visited", False)),
+        }
+        graph_features = {
+            'pe_norm_ratio': (dem["pe"] - self.vm_demand_ranges["pe"][0]) / (
+                    self.vm_demand_ranges["pe"][1] - self.vm_demand_ranges["pe"][0]),
+            'mips_norm_ratio': (dem["mips"] - self.vm_demand_ranges["mips"][0]) / (
+                    self.vm_demand_ranges["mips"][1] - self.vm_demand_ranges["mips"][0]),
+            'ram_norm_ratio': (dem["ram"] - self.vm_demand_ranges["ram"][0]) / (
+                    self.vm_demand_ranges["ram"][1] - self.vm_demand_ranges["ram"][0]),
+            'storage_norm_ratio': (dem["storage"] - self.vm_demand_ranges["storage"][0]) / (
+                    self.vm_demand_ranges["storage"][1] - self.vm_demand_ranges["storage"][0]),
         }
         return features, graph_features
 
@@ -714,94 +722,454 @@ class VMPlacementEnv(DiscreteEnv):
         return {"graph": np.array(pm_feats + vm_feats, dtype=np.float32)}
 
     def reset(self, seed=None, options=None):
-        # Reset to initial empirical worst allocation and recompute all metrics and features
-        super().pre_reset()
-        self.alloc_graph = copy.deepcopy(self.initial_alloc_graph)
-        self.sum_movement_costs = 0.0
-        self.same_pm_movements = 0
-        self.actual_movements = 0
-        self.actual_valid_movements = 0
-        self._initial_metrics = self._compute_metrics()
-        self.initial_score = self.compute_weighted_sum_normalized_metrics(self._initial_metrics)
-        self.previous_metrics = self._initial_metrics.copy()
-        self.current_metrics = self._initial_metrics.copy()
-        # update graphs
-        for vm_id in range(self.n_vms):
-            _, vm_feature = self._vm_features(f"VM_{vm_id}")
-            for key in vm_feature:
-                self.alloc_graph.nodes[f"VM_{vm_id}"]["x_dict"][key] = vm_feature[key]
-                self.traffic_graph.nodes[f"VM_{vm_id}"]["x_dict"][key] = vm_feature[key]
-
-        for pm_id in range(self.n_pms):
-            _, pm_feature = self._pm_features(f"PM_{pm_id}")
-            for key in pm_feature:
-                self.alloc_graph.nodes[f"PM_{pm_id}"]["x_dict"][key] = pm_feature[key]
-                self.latency_graph.nodes[f"PM_{pm_id}"]["x_dict"][key] = pm_feature[key]
-        self.obs = self._get_obs()
-        self.info = {}
-        super().post_reset()
-        return self.obs, self.info
+        if self.revisiting:
+            return self.reset_revisiting(seed=seed, options=options)
+        else:
+            return self.reset_non_revisiting(seed=seed, options=options)
 
     def step(self, vm_idx, pm_idx=None):
-        # Apply action, compute reward based on new metrics, and update observation. Reward is based on improvement in weighted sum of normalized metrics, with penalties for invalid actions and movements that don't change PM.
+        if self.revisiting:
+            return self.step_revisiting(vm_idx, pm_idx)
+        else:
+            return self.step_non_revisiting(vm_idx, pm_idx)
+
+    def step_non_revisiting(self, vm_idx, pm_idx=None):
+
         action = super().pre_step((vm_idx, pm_idx))
-        vms_changed, pms_changed = [], []
+
+        vms_changed = []
+        pms_changed = []
+
         if not self.invalid_action and not self.no_action:
+
             vm_idx, pm_idx = action
+
             if isinstance(vm_idx, int):
                 vm_idx = f"VM_{vm_idx}"
+
             if isinstance(pm_idx, int):
                 pm_idx = f"PM_{pm_idx}"
 
+            # --------------------------------------------------------
+            # Same PM = invalid / useless movement
+            # --------------------------------------------------------
             if pm_idx == self._get_pm_of_vm(vm_idx):
+
                 self.same_pm_movements += 1
-                self.reward = self.same_pm_penalty_sum / (
-                    min(self.max_steps_overall, self.max_steps_coefficient * (self.n_vms + self.n_pms)))
+
+                self.reward = (
+                        self.same_pm_penalty_sum /
+                        min(
+                            self.max_steps_overall,
+                            self.max_steps_coefficient *
+                            (self.n_vms + self.n_pms)
+                        )
+                )
+
             else:
+
                 self.actual_movements += 1
+
                 was_valid = self.is_valid_action(vm_idx, pm_idx)
+
                 if was_valid:
+
                     self.actual_valid_movements += 1
-                    movement_cost, vms_changed, pms_changed = self._place_vm(vm_idx, pm_idx)
+
+                    movement_cost, vms_changed, pms_changed = (
+                        self._place_vm(vm_idx, pm_idx)
+                    )
+
+                    # Once moved, this VM cannot be selected again
+                    vm = int(vm_idx.split("_")[1])
+
+                    self.action_list = [
+                        a for a in self.action_list
+                        if a[0] != vm
+                    ]
+
+                    self.semantic_action_list = [
+                        a for a in self.semantic_action_list
+                        if a[0] != vm
+                    ]
+
+                    self.alloc_graph.nodes[vm_idx]["x_dict"]["visited"] = True
+
+                    # Update metrics BEFORE calculating reward
+                    self.previous_metrics = self.current_metrics.copy()
+                    self.current_metrics = self._compute_metrics()
+
                     self.reward = self._reward()
+
                     if self.add_movement_cost:
-                        self.reward -= self.movement_coefficient * min_max_normalize(movement_cost, 0, self.max_latency_movement_cost)
-                        self.sum_movement_costs += min_max_normalize(movement_cost, 0, self.max_latency_movement_cost)
+                        normalized_cost = min_max_normalize(
+                            movement_cost,
+                            0,
+                            self.max_latency_movement_cost
+                        )
+
+                        self.reward -= (
+                                self.movement_coefficient * normalized_cost
+                        )
+
+                        self.sum_movement_costs += normalized_cost
+
                 else:
-                    self.reward = self.invalid_action_penalty_sum / (
-                        min(self.max_steps_overall, self.max_steps_coefficient * (self.n_vms + self.n_pms)))
 
-        self.previous_metrics = self.current_metrics
-        self.current_metrics = self._compute_metrics()
+                    self.reward = (
+                            self.invalid_action_penalty_sum /
+                            min(
+                                self.max_steps_overall,
+                                self.max_steps_coefficient *
+                                (self.n_vms + self.n_pms)
+                            )
+                    )
+
+        # ------------------------------------------------------------
+        # Termination: constructive mode
+        # ------------------------------------------------------------
+
+        mask = self.action_masks()
+
+        self.done = (
+                len(self.action_list) == 0
+                or not any(mask)
+        )
+
         if self.terminate_at_approximate_best:
-            self.done = self.current_metrics["weighted_sum"] >= self.best_score
-        else:
-            self.done = False
+            self.done |= (
+                    self.current_metrics["weighted_sum"] >= self.best_score
+            )
 
-        # update graphs
+        # Update graph features
+        self._update_changed_features(vms_changed, pms_changed)
+
+        self.obs = self._get_obs()
+        self.info = {}
+        self.action = (vm_idx, pm_idx)
+
+        super().post_step()
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info,
+        )
+
+    def _update_changed_features(self, vms_changed, pms_changed):
+
         for vm_id in vms_changed:
             _, vm_feature = self._vm_features(vm_id)
+
             for key in vm_feature:
                 self.alloc_graph.nodes[vm_id]["x_dict"][key] = vm_feature[key]
                 self.traffic_graph.nodes[vm_id]["x_dict"][key] = vm_feature[key]
 
         for pm_id in pms_changed:
             _, pm_feature = self._pm_features(pm_id)
+
             for key in pm_feature:
                 self.alloc_graph.nodes[pm_id]["x_dict"][key] = pm_feature[key]
                 self.latency_graph.nodes[pm_id]["x_dict"][key] = pm_feature[key]
 
+    def step_revisiting(self, vm_idx, pm_idx=None):
+
+        action = super().pre_step((vm_idx, pm_idx))
+
+        vms_changed = []
+        pms_changed = []
+
+        if not self.invalid_action and not self.no_action:
+
+            vm_idx, pm_idx = action
+
+            if isinstance(vm_idx, int):
+                vm_idx = f"VM_{vm_idx}"
+
+            if isinstance(pm_idx, int):
+                pm_idx = f"PM_{pm_idx}"
+
+            # --------------------------------------------------------
+            # Same PM
+            # --------------------------------------------------------
+
+            if pm_idx == self._get_pm_of_vm(vm_idx):
+
+                self.same_pm_movements += 1
+
+                self.reward = (
+                        self.same_pm_penalty_sum /
+                        min(
+                            self.max_steps_overall,
+                            self.max_steps_coefficient *
+                            (self.n_vms + self.n_pms)
+                        )
+                )
+
+            else:
+
+                self.actual_movements += 1
+
+                was_valid = self.is_valid_action(vm_idx, pm_idx)
+
+                if was_valid:
+
+                    self.actual_valid_movements += 1
+
+                    movement_cost, vms_changed, pms_changed = (
+                        self._place_vm(vm_idx, pm_idx)
+                    )
+
+                    # ------------------------------------------------
+                    # IMPORTANT:
+                    # Do NOT remove this VM from action_list.
+                    # Revisiting allows the same VM to move again.
+                    # ------------------------------------------------
+
+                    self.alloc_graph.nodes[vm_idx]["x_dict"]["visited"] = True
+
+                    # ------------------------------------------------
+                    # Calculate new metrics
+                    # ------------------------------------------------
+
+                    self.previous_metrics = self.current_metrics.copy()
+                    self.current_metrics = self._compute_metrics()
+
+                    # ------------------------------------------------
+                    # Local transition reward:
+                    #
+                    # reward = current score - previous score
+                    # ------------------------------------------------
+
+                    self.reward = self._reward()
+
+                    if self.add_movement_cost:
+                        normalized_cost = min_max_normalize(
+                            movement_cost,
+                            0,
+                            self.max_latency_movement_cost
+                        )
+
+                        self.reward -= (
+                                self.movement_coefficient * normalized_cost
+                        )
+
+                        self.sum_movement_costs += normalized_cost
+
+                    # ------------------------------------------------
+                    # Best-so-far tracking
+                    # ------------------------------------------------
+
+                    current_score = self.current_metrics["weighted_sum"]
+
+                    if current_score > self.best_episode_score:
+                        self.best_episode_score = current_score
+                        self.best_episode_allocation = (
+                            self._encode_allocation()
+                        )
+
+                else:
+
+                    self.reward = (
+                            self.invalid_action_penalty_sum /
+                            min(
+                                self.max_steps_overall,
+                                self.max_steps_coefficient *
+                                (self.n_vms + self.n_pms)
+                            )
+                    )
+
+        # ------------------------------------------------------------
+        # Revisiting termination:
+        # fixed exploration horizon
+        # ------------------------------------------------------------
+
+        # Optional approximate-best termination
+        if self.terminate_at_approximate_best:
+            self.done |= (
+                    self.current_metrics["weighted_sum"] >= self.best_score
+            )
+
+        # Update graph features
+        self._update_changed_features(
+            vms_changed,
+            pms_changed
+        )
+
         self.obs = self._get_obs()
         self.info = {}
         self.action = (vm_idx, pm_idx)
+
         super().post_step()
-        return self.obs, self.reward, self.done, self.truncated, self.info
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info,
+        )
+
+    def reset_non_revisiting(self, seed=None, options=None):
+        super().pre_reset()
+
+        # Start from the same feasible empirical allocation
+        # used to initialize the environment.
+        self.alloc_graph = copy.deepcopy(self.initial_alloc_graph)
+
+        self.sum_movement_costs = 0.0
+        self.same_pm_movements = 0
+        self.actual_movements = 0
+        self.actual_valid_movements = 0
+
+        # Reset visited flags
+        for vm in range(self.n_vms):
+            self.alloc_graph.nodes[f"VM_{vm}"]["x_dict"]["visited"] = False
+
+        # Compute initial metrics
+        self._initial_metrics = self._compute_metrics()
+        self.initial_score = self.compute_weighted_sum_normalized_metrics(
+            self._initial_metrics
+        )
+
+        self.previous_metrics = self._initial_metrics.copy()
+        self.current_metrics = self._initial_metrics.copy()
+
+        # Every VM is initially available to be moved once
+        self.action_list = self.build_action_list()
+        self.semantic_action_list = self.build_semantic_action_list()
+
+        self.steps = 0
+
+        # Observation
+        self.obs = self._get_obs()
+        self.info = {}
+
+        super().post_reset()
+
+        return self.obs, self.info
+
+    def _random_allocation(self, max_attempts=100):
+        """
+        Generate a random feasible VM -> PM allocation.
+
+        Retries the complete random construction if a greedy random
+        placement gets stuck.
+        """
+
+        for attempt in range(max_attempts):
+
+            # Reset PM usage
+            for pm_idx in range(self.n_pms):
+                pm = f"PM_{pm_idx}"
+
+                self.alloc_graph.nodes[pm]["x_dict"]["used"] = {
+                    k: 0 for k in self.pm_capacity_ranges
+                }
+
+                self.alloc_graph.nodes[pm]["x_dict"]["power"] = self.p_idle
+
+            # Remove current VM-PM allocations
+            self.alloc_graph.remove_edges_from(
+                list(self.alloc_graph.edges())
+            )
+
+            # Random VM ordering
+            vm_indices = list(range(self.n_vms))
+            random.shuffle(vm_indices)
+
+            success = True
+
+            for vm_idx in vm_indices:
+
+                vm = f"VM_{vm_idx}"
+
+                feasible_pms = [
+                    f"PM_{pm_idx}"
+                    for pm_idx in range(self.n_pms)
+                    if self.is_valid_action(vm, pm_idx)
+                ]
+
+                if not feasible_pms:
+                    success = False
+                    break
+
+                pm = random.choice(feasible_pms)
+
+                self._place_vm(vm, pm)
+
+            if success:
+                return self._encode_allocation()
+
+        raise RuntimeError(
+            f"Failed to generate a random feasible allocation "
+            f"after {max_attempts} attempts."
+        )
+
+    def reset_revisiting(self, seed=None, options=None):
+        super().pre_reset()
+
+        # ------------------------------------------------------------
+        # Random initial feasible allocation
+        # ------------------------------------------------------------
+        self.alloc_graph = copy.deepcopy(self.initial_alloc_graph)
+
+        # ------------------------------------------------------------
+        # Reset bookkeeping
+        # ------------------------------------------------------------
+        self.sum_movement_costs = 0.0
+        self.same_pm_movements = 0
+        self.actual_movements = 0
+        self.actual_valid_movements = 0
+
+        for vm_idx in range(self.n_vms):
+            self.alloc_graph.nodes[
+                f"VM_{vm_idx}"
+            ]["x_dict"]["visited"] = False
+
+        # ------------------------------------------------------------
+        # Initial metrics
+        # ------------------------------------------------------------
+
+        self._initial_metrics = self._compute_metrics()
+
+        self.initial_score = (
+            self.compute_weighted_sum_normalized_metrics(
+                self._initial_metrics
+            )
+        )
+
+        self.previous_metrics = self._initial_metrics.copy()
+        self.current_metrics = self._initial_metrics.copy()
+
+        # ------------------------------------------------------------
+        # Best solution at beginning of episode
+        # ------------------------------------------------------------
+
+        self.best_episode_score = self.initial_score
+        self.best_episode_allocation = self._encode_allocation()
+
+        # ------------------------------------------------------------
+        # Revisiting: all VM-PM actions remain available
+        # ------------------------------------------------------------
+
+        self.action_list = self.build_action_list()
+        self.semantic_action_list = self.build_semantic_action_list()
+
+        self.obs = self._get_obs()
+        self.info = {}
+
+        super().post_reset()
+
+        return self.obs, self.info
 
     def save_step_log(self):
         super().save_step_log()
         self.step_logs[-1].update({
             'observation': self.obs,
-            'alloc_graph_nodes':  graph_nodes_to_text(self.alloc_graph),
+            'alloc_graph_nodes': graph_nodes_to_text(self.alloc_graph),
             'alloc_graph_edges': graph_edges_to_text(self.alloc_graph),
             'action': str(self.action),
         })
@@ -909,10 +1277,10 @@ class VMPlacementEnv(DiscreteEnv):
         # compute normalized version of each
         if compute_norm and hasattr(self, 'metric_bounds'):
             for m in ["avg_util",
-                "packing_efficiency",
-                "avg_power",
-                "avg_load",
-                "avg_security_risk"]:
+                      "packing_efficiency",
+                      "avg_power",
+                      "avg_load",
+                      "avg_security_risk"]:
                 v = metrics[m]
                 min_v, max_v = self.metric_bounds[m]
 
@@ -940,10 +1308,14 @@ class VMPlacementEnv(DiscreteEnv):
         self._metrics = {}
         for k in self.current_metrics:
             self._metrics[k + "_difference"] = self.current_metrics[k] - self._initial_metrics[k]
-        self._metrics['avg_norm_movement_cost'] = self.sum_movement_costs / max(1, self.current_step - self.count_no_actions) if self.current_step - self.count_no_actions > 0 else 0.0
+        self._metrics['avg_norm_movement_cost'] = self.sum_movement_costs / max(1,
+                                                                                self.current_step - self.count_no_actions) if self.current_step - self.count_no_actions > 0 else 0.0
         self._metrics['actual_movements'] = self.actual_movements / self.current_step if self.current_step > 0 else 0.0
-        self._metrics['actual_valid_movements'] = self.actual_valid_movements / self.current_step if self.current_step > 0 else 0.0
-        self._metrics['same_pm_movements'] = self.same_pm_movements / self.current_step if self.current_step > 0 else 0.0
+        self._metrics[
+            'actual_valid_movements'] = self.actual_valid_movements / self.current_step if self.current_step > 0 else 0.0
+        self._metrics[
+            'same_pm_movements'] = self.same_pm_movements / self.current_step if self.current_step > 0 else 0.0
+
 
 class ExtendedVMPlacementEnv(VMPlacementEnv, ContinuousEnv):
     def __init__(self, **config):
@@ -957,119 +1329,132 @@ class ExtendedVMPlacementEnv(VMPlacementEnv, ContinuousEnv):
             'alloc_edges_number': Function(func=get_number_edges, graph_name='alloc_graph'),
             'alloc_average_node_degree': Function(func=get_average_node_degree, graph_name='alloc_graph'),
             'alloc_graph_density': Function(func=get_graph_density, graph_name='alloc_graph'),
-            'traffic_graph': Graph(poolings=[MeanPooling, SumPooling, MinPooling, MaxPooling], graph_name='traffic_graph'),
+            'traffic_graph': Graph(poolings=[MeanPooling, SumPooling, MinPooling, MaxPooling],
+                                   graph_name='traffic_graph'),
             'traffic_nodes_number': Function(func=get_number_nodes, graph_name='traffic_graph'),
             'traffic_edges_number': Function(func=get_number_edges, graph_name='traffic_graph'),
             'traffic_average_node_degree': Function(func=get_average_node_degree, graph_name='traffic_graph'),
             'traffic_graph_density': Function(func=get_graph_density, graph_name='traffic_graph'),
-            'latency_graph': Graph(poolings=[MeanPooling, SumPooling, MinPooling, MaxPooling], graph_name='latency_graph'),
+            'latency_graph': Graph(poolings=[MeanPooling, SumPooling, MinPooling, MaxPooling],
+                                   graph_name='latency_graph'),
             'latency_nodes_number': Function(func=get_number_nodes, graph_name='latency_graph'),
             'latency_edges_number': Function(func=get_number_edges, graph_name='latency_graph'),
             'latency_average_node_degree': Function(func=get_average_node_degree, graph_name='latency_graph'),
             'latency_graph_density': Function(func=get_graph_density, graph_name='latency_graph'),
             'action_space': ActionSpace(poolings=[MeanPooling, SumPooling, MaxPooling, MinPooling])
         }
-        self._action_type = {
-            'VM': Node(spec={"type": "VM"}, graph_name='alloc_graph'),
-            'PM': Node(spec={"type": "PM"}, graph_name='alloc_graph')
-        }
+        if self.revisiting:
+            self._action_type = {
+                'VM': Node(spec={"type": "VM"}, graph_name='alloc_graph'),
+                'PM': Node(spec={"type": "PM"}, graph_name='alloc_graph')
+            }
+        else:
+            self._action_type = {
+                'VM': Node(spec={"type": "VM", "visited": False}, graph_name='alloc_graph'),
+                'PM': Node(spec={"type": "PM"}, graph_name='alloc_graph')
+            }
         if self.no_action_support:
             self.discrete_actions = ["no_action"]
         else:
             self.discrete_actions = []
         self._node_attributes = {
             'type': Attribute(feature_extractor=OneHotEncoding,
-                                feature_extractor_args={'set': ['PM', 'VM']},
-                                encoding=BinaryValue(),
-                                embedding_size=2,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                              feature_extractor_args={'set': ['PM', 'VM']},
+                              encoding=BinaryValue(),
+                              embedding_size=2,
+                              graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+            'visited': Attribute(
+                encoding=BinaryValue(),
+                embedding_size=1,
+                graph_name=['alloc_graph']
+            ),
             'tenant': Attribute(encoding=ContinuousValue(
                 normalization="min_max",
                 min_value=0,
                 max_value=self.n_tenants - 1
             ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'pe_norm_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'mips_norm_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'ram_norm_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'storage_norm_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'pe_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'mips_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                         embedding_size=1,
-                                         graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'ram_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'storage_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
             'power_ratio': Attribute(encoding=ContinuousValue(
-                                    normalization="min_max",
-                                    min_value=0.0,
-                                    max_value=1.0
-                                ),
-                                embedding_size=1,
-                                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
+                normalization="min_max",
+                min_value=0.0,
+                max_value=1.0
+            ),
+                embedding_size=1,
+                graph_name=['alloc_graph', 'traffic_graph', 'latency_graph']),
 
         }
         self._edge_attributes = {
             'traffic': Attribute(encoding=ContinuousValue(
-                                normalization="min_max",
-                                min_value=self.min_traffic,
-                                max_value=self.max_traffic
+                normalization="min_max",
+                min_value=self.min_traffic,
+                max_value=self.max_traffic
             ),
-                                embedding_size=1,
-                                 graph_name='traffic_graph'),
+                embedding_size=1,
+                graph_name='traffic_graph'),
             'latency': Attribute(encoding=ContinuousValue(
-                                normalization="min_max",
-                                min_value=self.latency_min,
-                                max_value=self.latency_max
+                normalization="min_max",
+                min_value=self.latency_min,
+                max_value=self.latency_max
             ),
-                                embedding_size=1,
-                                 graph_name='latency_graph'),
+                embedding_size=1,
+                graph_name='latency_graph'),
         }
         self.action_candidates_reconstruction = False
         self.reconstruct_only_changed_nodes = False

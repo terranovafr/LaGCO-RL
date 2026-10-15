@@ -15,6 +15,7 @@ from stable_baselines3 import PPO, TD3, SAC, DDPG, DQN
 from stable_baselines3.a2c import A2C
 from sb3_contrib import RecurrentPPO, TRPO, TQC, MaskablePPO
 from sb3_sa_contrib.dqn import iDQN
+import yaml
 
 # Mapping algorithm type to model class and additional parameters
 algorithm_models = {
@@ -41,8 +42,39 @@ activation_functions = {
         "ELU": nn.ELU
     }
 
+
+def set_nested_value(d, key_path, value):
+    keys = key_path.split(".")
+    current = d
+
+    for key in keys[:-1]:
+        if key not in current:
+            current[key] = {}
+        current = current[key]
+
+    current[keys[-1]] = value
+
+
+def apply_overrides(config, overrides):
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"Invalid override '{item}', expected key=value")
+
+        key, value = item.split("=", 1)
+
+        # convert string to Python type
+        value = yaml.safe_load(value)
+        if key == "embedding_size":
+            if 'model_config' in config:
+                config['model_config']['layers'][-1]['out_channels'] = value
+        else:
+            set_nested_value(config, key, value)
+    return config
+
 def check_args(args):
     # Check for compatibility of arguments based on the algorithm type and other options. For example, if semantic ordering is enabled, the algorithm type must be "discrete". If saving embeddings is enabled, the algorithm type must be "projection" or "iterative". If using feature vectors as action points is enabled, the algorithm type must be "projection" or "iterative". Return a tuple of (is_valid, message) where is_valid is a boolean indicating whether the arguments are valid and message is a string describing the reason if they are not valid or "OK" if they are valid.
+    if args.projection_agent and args.algorithm_type != "iterative":
+        return False, "Projection agent option is only compatible with iterative algorithm type"
     if args.semantic_ordering and args.algorithm_type != "discrete":
         return False, "Semantic ordering is only compatible with discrete action spaces"
     if args.save_embeddings and (args.algorithm_type != "projection" and args.algorithm_type != "iterative"):

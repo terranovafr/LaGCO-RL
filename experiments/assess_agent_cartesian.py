@@ -4,10 +4,13 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 '''
-This script runs a full pipeline of experiments to assess the performance of RL agents trained on a single environment and tested on a range of environments of increasing difficulty/size.
-The training environment is selected based on a specified sampling strategy (largest, smallest, mean, or random) using important parameters defined in the environment ranges configuration.
+    assess_agent_cartesian.py
+    This script runs a full pipeline of experiments to assess the performance of RL agents trained on a single environment and tested on a range of environments of increasing difficulty/size.
+    The training environment is selected based on a specified sampling strategy (largest, smallest, mean, or random) using important parameters defined in the environment ranges configuration.
 '''
+
 import random
 import numpy as np
 import argparse
@@ -79,11 +82,13 @@ def run_cartesian_experiments(env_name,
 
     print(f"[INFO] Detected train sizes: {sizes}")
 
-    if args.option == "action_time":
-        # keep only the smallest size for training
-        train_sizes = [sizes[0]]
+    if args.min_train_size is not None:
+        train_sizes = [s for s in sizes if s >= args.min_train_size]
     else:
         train_sizes = sizes
+
+    if args.option == "action_time":
+        train_sizes = [train_sizes[0]]
 
     # 3. Loop per training size
     logs_folders = {}
@@ -289,6 +294,13 @@ def main():
     parser.add_argument("--skip_training", action="store_true")
     parser.add_argument("--val_pct", type=float, default=-1)
     parser.add_argument("--test_pct", type=float, default=-1)
+    parser.add_argument(
+        "--min_train_size",
+        type=int,
+        default=None,
+        help="Only consider training sizes >= this value."
+    )
+    parser.add_argument("-approx", "--approximate_distance", action="store_true")
     # ===== Resource control =====
     parser.add_argument("--max_parallel_test", type=int, default=1)
     args = parser.parse_args()

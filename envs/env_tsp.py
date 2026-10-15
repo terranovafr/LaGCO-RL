@@ -45,7 +45,7 @@ class TSPEnv(DiscreteEnv):
         # Precompute distance matrix
         self._compute_distance_matrix()
 
-        obs_len = self.num_cities * 2 + self.num_cities + (self.num_cities * (self.num_cities - 1)) // 2
+        obs_len = self.num_cities * 2 + self.num_cities * 2 + (self.num_cities * (self.num_cities - 1)) // 2
         self.observation_space = spaces.Dict({
             "graph": spaces.Box(
                 low=0,
@@ -56,33 +56,74 @@ class TSPEnv(DiscreteEnv):
         })
         self.current_length = 0.0
         self.current_length_worst_case = 0.0
+        self.start_city = None  # first chosen city
+        self.current_city = None
+        self.tour = []
         self.visited = np.zeros(self.num_cities, dtype=bool)
-        self.start_city = random.randint(0, self.num_cities - 1)
-        self.visited[self.start_city] = True
-        self.tour = [self.start_city]
-        self.bounds_per_start_city = {}
+        self.graph = nx.Graph()
+        for i in range(self.num_cities):
+            self.graph.add_node(i, x_dict={'x': self.city_coords[i][0], 'y': self.city_coords[i][1],
+                                           'visited': self.visited[i], 'current': False})
+        if self.shortest_K_edges is None:
+            for i, j in itertools.combinations(range(self.num_cities), 2):
+                self.graph.add_edge(i, j, edge_attr_dict={'weight': self.dist_matrix[i, j]})
+        else:
+            for i in range(self.num_cities):
+                knn = np.argsort(self.dist_matrix[i])[1:self.shortest_K_edges + 1]
+                for j in knn:
+                    if not self.graph.has_edge(i, j):
+                        self.graph.add_edge(
+                            i,
+                            j,
+                            edge_attr_dict={'weight': self.dist_matrix[i, j]}
+                        )
         self.length_best, self.length_worst = self.estimate_bounds(self.max_sweeps)
-        self.bounds_per_start_city[self.start_city] = (self.length_best, self.length_worst)
         self.action_list = list(range(self.num_cities))
         self.semantic_action_list = self.build_semantic_action_list()
         super().post_init()
         self.reset()
 
+    def set_optimal_length(self, optimal_length):
+        # Set the optimal length of the episode based on the number of VMs and PMs
+        self.length_best = optimal_length  # For example, twice the number of VMs
+
     def build_semantic_action_list(self):
-        # order nodes based on distance from current city (closest first)
-        cities = np.arange(self.num_cities)
-        other_cities = np.delete(cities, self.start_city)  # exclude start city
-        distances = self.dist_matrix[self.start_city, other_cities]
-        sorted_indices = np.argsort(distances)
-        sorted_cities = other_cities[sorted_indices]
-        return sorted_cities.tolist()
+        centroid = np.mean(self.city_coords, axis=0)
+        distances = np.linalg.norm(
+            self.city_coords - centroid,
+            axis=1
+        )
+        return np.argsort(distances).tolist()
+
+    def _normalized_coords(self):
+        coords = self.city_coords.copy()
+
+        # Center at origin
+        coords -= coords.mean(axis=0)
+
+        # Scale to unit variance
+        std = coords.std(axis=0)
+        std[std < 1e-8] = 1.0
+        coords /= std
+
+        return coords
 
     def _tour_length(self, tour):
-        # Calculate total length of the given tour (including return to start)
+
         length = 0.0
+
         for i in range(len(tour) - 1):
-            length += self.dist_matrix[tour[i], tour[i + 1]]
-        length += self.dist_matrix[tour[-1], tour[0]]
+            u = tour[i]
+            v = tour[i + 1]
+
+            d = self.dist_matrix[u, v]
+
+            length += d
+
+        d = self.dist_matrix[tour[-1], tour[0]]
+
+        length += d
+
         return length
 
     def _two_opt_swap(self, tour, i, j):
@@ -92,30 +133,40 @@ class TSPEnv(DiscreteEnv):
         return new_tour
 
     def estimate_bounds(self, samples=1000, local_steps=20, candidate_pairs=20):
-        # Heuristic-driven estimation of best and worst tour lengths using randomized 2-opt local search
         cities = np.arange(self.num_cities)
-        other_cities = np.delete(cities, self.start_city)
-
         best_length = np.inf
         worst_length = -np.inf
 
         for _ in tqdm(range(samples), desc="Estimating bounds"):
-            perm = np.random.permutation(other_cities)
-            tour = np.concatenate(([self.start_city], perm))
 
+            tour = np.random.permutation(cities)
             base_length = self._tour_length(tour)
 
-            # ----- best: randomized improving 2-opt -----
+
+            # sanity check
+            assert len(np.unique(tour)) == self.num_cities
+            assert len(tour) == self.num_cities
+
+            ####################################################################
+            # BEST
+            ####################################################################
+
             best_tour = tour.copy()
             best_local = base_length
 
-            for _ in range(local_steps):
+            for step in range(local_steps):
+
                 candidates = []
-                for _ in range(candidate_pairs):
-                    i, j = sorted(random.sample(range(1, self.num_cities), 2))  # keep start fixed
+
+                for pair in range(candidate_pairs):
+
+                    i, j = sorted(random.sample(range(1, self.num_cities), 2))
+
                     new_tour = self._two_opt_swap(best_tour, i, j)
                     new_len = self._tour_length(new_tour)
+
                     gain = best_local - new_len
+
                     if gain > 0:
                         candidates.append((new_tour, new_len, gain))
 
@@ -125,23 +176,37 @@ class TSPEnv(DiscreteEnv):
                 chosen = random.choices(
                     candidates,
                     weights=[gain for _, _, gain in candidates],
-                    k=1
+                    k=1,
                 )[0]
-                best_tour, best_local, _ = chosen
 
-            # ----- worst: randomized worsening 2-opt -----
+                best_tour, best_local, gain = chosen
+
+
+
+            ####################################################################
+            # WORST
+            ####################################################################
+
             worst_tour = tour.copy()
             worst_local = base_length
 
-            for _ in range(local_steps):
+            for step in range(local_steps):
+
                 candidates = []
-                for _ in range(candidate_pairs):
+
+                for pair in range(candidate_pairs):
+
                     i, j = sorted(random.sample(range(1, self.num_cities), 2))
+
                     new_tour = self._two_opt_swap(worst_tour, i, j)
                     new_len = self._tour_length(new_tour)
+
                     gain = new_len - worst_local
+
                     if gain > 0:
                         candidates.append((new_tour, new_len, gain))
+
+
 
                 if not candidates:
                     break
@@ -149,14 +214,35 @@ class TSPEnv(DiscreteEnv):
                 chosen = random.choices(
                     candidates,
                     weights=[gain for _, _, gain in candidates],
-                    k=1
+                    k=1,
                 )[0]
-                worst_tour, worst_local, _ = chosen
+
+                worst_tour, worst_local, gain = chosen
 
             best_length = min(best_length, best_local)
             worst_length = max(worst_length, worst_local)
 
+
         return best_length, worst_length
+
+    def export_graph(self, path):
+        """
+        Export the current TSP instance in TSPLIB format.
+
+        The exported instance always contains the complete problem,
+        regardless of shortest_K_edges.
+        """
+        with open(path, "w") as f:
+            f.write(f"NAME: tsp_{self.num_cities}\n")
+            f.write("TYPE: TSP\n")
+            f.write(f"DIMENSION: {self.num_cities}\n")
+            f.write("EDGE_WEIGHT_TYPE: EUC_2D\n")
+            f.write("NODE_COORD_SECTION\n")
+
+            for i, (x, y) in enumerate(self.city_coords, start=1):
+                f.write(f"{i} {x:.10f} {y:.10f}\n")
+
+            f.write("EOF\n")
 
     def update_config(self, config):
         super().update_config(config)
@@ -183,32 +269,46 @@ class TSPEnv(DiscreteEnv):
         super().pre_reset()
         self.visited = np.zeros(self.num_cities, dtype=bool)
         # Start from random city
-        self.start_city = random.randint(0, self.num_cities - 1)
-        self.visited[self.start_city] = True
-        self.tour = [self.start_city]
+        self.start_city = np.random.randint(self.num_cities)
         self.current_city = self.start_city
-        # Rebuild graph with updated visited status
-        self.graph = nx.Graph()
-        for i in range(self.num_cities):
-            self.graph.add_node(i, x_dict={'x': self.city_coords[i][0], 'y': self.city_coords[i][1], 'visited': self.visited[i]})
-        if self.shortest_K_edges is None:
-            for i, j in itertools.combinations(range(self.num_cities), 2):
-                self.graph.add_edge(i, j, edge_attr_dict={'weight': self.dist_matrix[i, j]})
-        else:
-            for i in range(self.num_cities):
-                knn = np.argsort(self.dist_matrix[i])[1:self.shortest_K_edges + 1]
-                for j in knn:
-                    if not self.graph.has_edge(i, j):
-                        self.graph.add_edge(
-                            i,
-                            j,
-                            edge_attr_dict={'weight': self.dist_matrix[i, j]}
-                        )
+
         self.tour = [self.start_city]
+        self.visited[self.start_city] = True
+
         self.current_length = 0.0
         self.prev_length = 0.0
-        self.prev_length_worst_case = 0.0
+
+
         self.current_length_worst_case = self.length_worst
+        self.prev_length_worst_case = self.length_worst
+
+
+        # Rebuild graph with updated visited status
+        if not hasattr(self, 'graph'):
+            self.graph = nx.Graph()
+            for i in range(self.num_cities):
+                self.graph.add_node(i, x_dict={'x': self.city_coords[i][0], 'y': self.city_coords[i][1],
+                                               'visited': self.visited[i], 'current': False})
+            if self.shortest_K_edges is None:
+                for i, j in itertools.combinations(range(self.num_cities), 2):
+                    self.graph.add_edge(i, j, edge_attr_dict={'weight': self.dist_matrix[i, j]})
+            else:
+                for i in range(self.num_cities):
+                    knn = np.argsort(self.dist_matrix[i])[1:self.shortest_K_edges + 1]
+                    for j in knn:
+                        if not self.graph.has_edge(i, j):
+                            self.graph.add_edge(
+                                i,
+                                j,
+                                edge_attr_dict={'weight': self.dist_matrix[i, j]}
+                            )
+        for i in range(self.num_cities):
+            self.graph.nodes[i]["x_dict"]["visited"] = False
+            self.graph.nodes[i]["x_dict"]["current"] = False
+
+        self.graph.nodes[self.start_city]["x_dict"]["visited"] = True
+        self.graph.nodes[self.start_city]["x_dict"]["current"] = True
+
         self.obs = self._get_obs()
         self.info = {}
         self.post_reset()
@@ -218,10 +318,12 @@ class TSPEnv(DiscreteEnv):
         # Observation consists of coordinates, visited status, and flattened upper triangle of distance matrix
         coords_flat = self.city_coords.flatten()
         visited_float = self.visited.astype(np.float32)
+        current_city_float = np.zeros(self.num_cities, dtype=np.float32)
+        current_city_float[self.current_city] = 1.0
         weights_flat = []
         for i, j in itertools.combinations(range(self.num_cities), 2):
             weights_flat.append(self.dist_matrix[i, j])
-        obs = np.concatenate([coords_flat, visited_float, weights_flat])
+        obs = np.concatenate([coords_flat, visited_float, current_city_float, weights_flat])
         return {"graph": obs.astype(np.float32)}
 
     def is_valid_action(self, node_id):
@@ -256,9 +358,12 @@ class TSPEnv(DiscreteEnv):
 
                     self.visited[next_city] = True
                     self.tour.append(next_city)
+                    self.graph.nodes[self.current_city]['x_dict']['current'] = False
                     self.current_city = next_city
 
                     self.graph.nodes[next_city]['x_dict']['visited'] = True
+                    self.graph.nodes[self.current_city]['x_dict']['current'] = True
+
 
                     all_visited_at_least_once = all(self.visited)
 
@@ -269,7 +374,7 @@ class TSPEnv(DiscreteEnv):
                             self.current_length += self.dist_matrix[self.current_city, self.start_city]
 
                             if self.reward_type == "relative":
-                                self.reward += (
+                                self.reward = (
                                         (self.length_worst - self.current_length)
                                         / (self.length_worst - self.length_best + 1e-8)
                                 )
@@ -292,9 +397,11 @@ class TSPEnv(DiscreteEnv):
 
                 self.visited[next_city] = True
                 self.tour.append(next_city)
+                self.graph.nodes[self.current_city]['x_dict']['current'] = False
                 self.current_city = next_city
 
                 self.graph.nodes[next_city]['x_dict']['visited'] = True
+                self.graph.nodes[next_city]['x_dict']['current'] = True
 
                 remaining_nodes = [i for i in range(self.num_cities) if not self.visited[i]]
                 worst_case_remaining = 0.0
@@ -394,6 +501,12 @@ class ExtendedTSPEnv(TSPEnv, ContinuousEnv):
                             encoding=BinaryValue(),
                             embedding_size=1,
                             graph_name='graph'),
+            'current': Attribute(
+                feature_extractor=IdentityEncoding,
+                encoding=BinaryValue(),
+                embedding_size=1,
+                graph_name='graph'
+            ),
         }
         # compute min_weight and max_weights
         self.min_weight = np.min(self.dist_matrix)
@@ -414,6 +527,8 @@ class ExtendedTSPEnv(TSPEnv, ContinuousEnv):
             self.discrete_actions = []
         if self.remove_invalid_actions:
             self.action_candidates_reconstruction = True
+        else:
+            self.action_candidates_reconstruction = False
         self.action_space_reconstruction_each_step = True
         self.reconstruct_only_changed_nodes = False
 

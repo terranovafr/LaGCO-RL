@@ -8,21 +8,22 @@
     plot_agent_comparison.py
     Script to compare agent performances across solutions and environment sampling cases, with statistical analysis and LaTeX table generation.
 """
-
 import argparse
-import pandas as pd
 from datetime import datetime
 import sys
 import os
+import numpy as np
+import pandas as pd
 import re
 import fnmatch
-import numpy as np
+import math
+from scipy.stats import shapiro
+from tabulate import tabulate
 import matplotlib.pyplot as plt
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.file_utils import load_yaml
 from utils.math_utils import bootstrap_ci, compute_indicator, compute_mean_std_bci
 script_dir = os.path.dirname(os.path.abspath(__file__))
-from scipy.stats import shapiro
 
 SOLUTION_DISPLAY_NAMES = {
     "DO_discrete": "P-Discrete",
@@ -47,33 +48,102 @@ ENV_DISPLAY_NAMES = {
     "traffic_engineering": "Traffic",
 }
 
+def get_override_values(case_data, override):
+    """
+    Supports both:
+      - old format: case_data = np.ndarray
+      - override format: case_data = {override: np.ndarray}
+    """
+    if case_data is None:
+        return None
+
+    if isinstance(case_data, dict):
+        return case_data.get(override)
+
+    # Old/non-override format
+    if override == "default":
+        return case_data
+
+    return None
+
 def format_env_name(env):
     return ENV_DISPLAY_NAMES.get(env.lower(), env)
+def _is_override_format(metrics_dict):
+    """
+    Detects:
+        sol -> case -> override -> values   (NEW)
+        sol -> case -> values              (OLD)
+    """
 
+    for sol_data in metrics_dict.values():
+        if not isinstance(sol_data, dict):
+            continue
+
+        for case_data in sol_data.values():
+            if not isinstance(case_data, dict):
+                continue
+
+            # If values are arrays → this is override format
+            # (because keys are override names mapping to arrays)
+
+            for v in case_data.values():
+                if isinstance(v, np.ndarray):
+                    return True
+
+            return False
+
+    return False
 
 CSV_PREFIX = "average_performances_best_val_"  # assuming this is defined somewhere
 
 def check_normality(all_results):
-    # Shapiro-Wilk test for normality on each (env, solution, case) group
+    # Shapiro-Wilk test for normality on each (env, solution, case, override)
+
     print("\n=== NORMALITY TEST (Shapiro-Wilk) ===")
 
     for env in all_results:
         for sol in all_results[env]:
             for case in all_results[env][sol]:
-                data = np.asarray(all_results[env][sol][case])
-                if len(data) < 3:
-                    continue
 
-                stat, p = shapiro(data)
+                data = all_results[env][sol][case]
 
-                normal = "YES" if p > 0.05 else "NO"
+                # -------------------------------------------------
+                # CASE 1: override structure
+                # -------------------------------------------------
+                if isinstance(data, dict):
 
-                print(
-                    f"{env} | {sol} | {case} -> "
-                    f"W={stat:.3f}, p={p:.3e} => Normal: {normal}"
-                )
+                    for override, values in data.items():
 
+                        values = np.asarray(values)
 
+                        if len(values) < 3:
+                            continue
+
+                        stat, p = shapiro(values)
+                        normal = "YES" if p > 0.05 else "NO"
+
+                        print(
+                            f"{env} | {sol} | {case} | {override} -> "
+                            f"W={stat:.3f}, p={p:.3e} => Normal: {normal}"
+                        )
+
+                # -------------------------------------------------
+                # CASE 2: old structure (no override)
+                # -------------------------------------------------
+                else:
+
+                    values = np.asarray(data)
+
+                    if len(values) < 3:
+                        continue
+
+                    stat, p = shapiro(values)
+                    normal = "YES" if p > 0.05 else "NO"
+
+                    print(
+                        f"{env} | {sol} | {case} -> "
+                        f"W={stat:.3f}, p={p:.3e} => Normal: {normal}"
+                    )
 
 def load_env_indicators_from_multiple_runs(
     solution_root_folder,
@@ -82,24 +152,13 @@ def load_env_indicators_from_multiple_runs(
     env_id_col="environment_ID",
     no_training=False,
 ):
-    """
-    Detect run_* folders inside solution_root_folder.
-    If found:
-        - Load metrics from each run
-        - Concatenate test env metrics across runs
-        - Aggregate training stats across runs
-        - Merge per-env scores across runs by averaging the score of the same env_id
-    Otherwise:
-        - Fallback to single-run loader
-    """
-
     run_folders = [
         os.path.join(solution_root_folder, d)
         for d in os.listdir(solution_root_folder)
         if d.startswith("run_") and os.path.isdir(os.path.join(solution_root_folder, d))
     ]
 
-    # SINGLE RUN
+    # SINGLE RUN CASE
     if not run_folders:
         return load_env_indicators_from_csv(
             solution_root_folder,
@@ -109,13 +168,12 @@ def load_env_indicators_from_multiple_runs(
             no_training
         )
 
-    all_test_metrics = []
-    all_test_env_scores = {}  # env_id -> list of scores across runs
-    all_train_metrics = []
+    # structure: override_name -> aggregated results across runs
+    override_results = {}
 
     for run_folder in sorted(run_folders):
         try:
-            test_metrics, train_metrics, test_env_score_map = load_env_indicators_from_csv(
+            run_outputs = load_env_indicators_from_csv(
                 run_folder,
                 metric_column,
                 indicator,
@@ -123,30 +181,62 @@ def load_env_indicators_from_multiple_runs(
                 no_training
             )
 
-            if train_metrics is not None:
-                all_train_metrics.extend(train_metrics)
+            for override_name, (test_metrics, train_metrics, env_map) in run_outputs.items():
 
-            if test_metrics is not None:
-                all_test_metrics.extend(test_metrics)
+                if override_name not in override_results:
+                    override_results[override_name] = {
+                        "test": [],
+                        "train": [],
+                        "env": {}
+                    }
 
-            for env_id, score in test_env_score_map.items():
-                all_test_env_scores.setdefault(env_id, []).append(score)
+                if test_metrics is not None:
+                    override_results[override_name]["test"].extend(test_metrics)
+
+                if train_metrics is not None:
+                    override_results[override_name]["train"].extend(train_metrics)
+
+                for env_id, score in env_map.items():
+                    if indicator == "concat":
+                        override_results[override_name]["env"].setdefault(env_id, []).append(
+                            np.asarray(score)
+                        )
+                    else:
+                        override_results[override_name]["env"].setdefault(env_id, []).append(score)
 
         except Exception as e:
             print(f"Warning in run folder '{run_folder}': {e}")
 
-    if not all_test_metrics:
-        raise RuntimeError("No test metrics found across runs")
+    if not override_results:
+        raise RuntimeError("No metrics found across runs")
 
-    # average repeated env_id scores across runs
-    merged_test_env_score_map = {
-        env_id: float(np.mean(scores))
-        for env_id, scores in all_test_env_scores.items()
-    }
+    # finalize aggregation per override
+    final_results = {}
 
+    for override_name, data in override_results.items():
 
-    return np.asarray(all_test_metrics),  np.asarray(all_train_metrics), merged_test_env_score_map
+        test_metrics = np.asarray(data["test"])
+        train_metrics = np.asarray(data["train"]) if data["train"] else None
 
+        if indicator == "concat":
+            merged_env_map = {
+                env_id: np.concatenate(scores)
+                for env_id, scores in data["env"].items()
+            }
+            print("MERGED ENV MAP (concat):", {k: v for k, v in merged_env_map.items()})
+        else:
+            merged_env_map = {
+                env_id: float(np.mean(scores))
+                for env_id, scores in data["env"].items()
+            }
+
+        final_results[override_name] = (
+            test_metrics,
+            train_metrics,
+            merged_env_map,
+        )
+
+    return final_results
 
 def find_best_performance_csv(solution_folder):
     """
@@ -235,55 +325,131 @@ def find_latest_env_with_episodes(logs_path):
         parent_dir = os.path.dirname(best_ne[0]["file"])
         results[split] = parent_dir
 
-        #print(f"[{split}] Max episodes: {max_episodes}")
-        #print(f"[{split}] Selected file: {results[split]}")
     return results["training_set"], results["test_set"]
-
 
 def plot_mean_ci(metrics_dict, save_path=None):
     """
-    Plot mean, IQM, and 95% bootstrap CI for multiple solutions.
-    Handles negative values correctly.
+    Supports:
+      - OLD: sol -> array
+      - NEW: sol -> override -> array
     """
-    solution_names = list(metrics_dict.keys())
-    means = []
-    iqms = []
-    maxs = []
-    lower_errors = []
-    upper_errors = []
 
-    for sol in solution_names:
-        data = np.array(metrics_dict[sol])
-        mean = np.mean(data)
-        means.append(mean)
+    override_mode = _is_override_format(metrics_dict)
 
-        # IQM: mean of middle 50%
-        ci25, ci75 = np.percentile(data, [25, 75])
-        iqm = data[(data >= ci25) & (data <= ci75)].mean()
-        iqms.append(iqm)
-
-        max = np.max(data)
-        maxs.append(max)
-
-        # Bootstrap CI of the mean
-        ci_lower, ci_upper = bootstrap_ci(data, 10000, 95)
-        lower_errors.append(mean - ci_lower)
-        upper_errors.append(ci_upper - mean)
-
-    x = np.arange(len(solution_names))
     plt.figure(figsize=(10, 6))
 
-    yerr = np.array([lower_errors, upper_errors])
+    if not override_mode:
+        # =========================
+        # OLD BEHAVIOR (UNCHANGED)
+        # =========================
+        solution_names = list(metrics_dict.keys())
 
-    plt.bar(x, means, yerr=yerr, capsize=5, color='black', edgecolor='blue', alpha=0.7, label='Mean ± 95% CI')
-    plt.scatter(x, iqms, color='black', zorder=5, label='IQM')
-    plt.scatter(x, maxs, color='red', zorder=5, label='Max')
-    plt.xticks(x, solution_names)
-    plt.ylabel("Agent Score")
-    plt.title("Mean, IQM, and 95% Bootstrap CI Across Solutions")
-    plt.axhline(0, color='gray', linewidth=0.8)
-    plt.legend()
-    plt.tight_layout()
+        means, iqms, maxs = [], [], []
+        lower_errors, upper_errors = [], []
+
+        for sol in solution_names:
+            data = np.asarray(metrics_dict[sol])
+
+            mean = np.mean(data)
+            means.append(mean)
+
+            ci25, ci75 = np.percentile(data, [25, 75])
+            iqm = data[(data >= ci25) & (data <= ci75)].mean()
+            iqms.append(iqm)
+
+            maxs.append(np.max(data))
+
+            ci_lower, ci_upper = bootstrap_ci(data, 10000, 95)
+            lower_errors.append(mean - ci_lower)
+            upper_errors.append(ci_upper - mean)
+
+        x = np.arange(len(solution_names))
+        yerr = np.array([lower_errors, upper_errors])
+
+        plt.bar(x, means, yerr=yerr, capsize=5,
+                color='black', edgecolor='blue', alpha=0.7,
+                label='Mean ± 95% CI')
+
+        plt.scatter(x, iqms, color='black', label='IQM')
+        plt.scatter(x, maxs, color='red', label='Max')
+
+        plt.xticks(x, solution_names)
+        plt.ylabel("Agent Score")
+        plt.title("Mean, IQM, and 95% Bootstrap CI Across Solutions")
+        plt.axhline(0, color='gray', linewidth=0.8)
+        plt.legend()
+        plt.tight_layout()
+
+    else:
+        # =========================
+        # NEW OVERRIDE BEHAVIOR
+        # =========================
+
+        solutions = list(metrics_dict.keys())
+        overrides = sorted({
+            o
+            for sol in solutions
+            for o in metrics_dict[sol].keys()
+        })
+
+        x = np.arange(len(solutions))
+        bar_width = 0.8 / max(len(overrides), 1)
+
+        colors = plt.cm.tab10.colors
+
+        for i, override in enumerate(overrides):
+            means = []
+            iqms = []
+            maxs = []
+
+            lower_errors = []
+            upper_errors = []
+
+            for sol in solutions:
+                if override not in metrics_dict[sol]:
+                    means.append(np.nan)
+                    iqms.append(np.nan)
+                    maxs.append(np.nan)
+                    lower_errors.append(0)
+                    upper_errors.append(0)
+                    continue
+
+                data = np.asarray(metrics_dict[sol][override])
+
+                mean = np.mean(data)
+                means.append(mean)
+
+                ci25, ci75 = np.percentile(data, [25, 75])
+                iqm = data[(data >= ci25) & (data <= ci75)].mean()
+                iqms.append(iqm)
+
+                maxs.append(np.max(data))
+
+                ci_lower, ci_upper = bootstrap_ci(data, 10000, 95)
+                lower_errors.append(mean - ci_lower)
+                upper_errors.append(ci_upper - mean)
+
+            offsets = x + (i - len(overrides)/2) * bar_width + bar_width/2
+
+            plt.bar(
+                offsets,
+                means,
+                width=bar_width,
+                yerr=[lower_errors, upper_errors],
+                capsize=4,
+                alpha=0.8,
+                label=f"{override}"
+            )
+
+            plt.scatter(offsets, iqms, s=20, color='black')
+            plt.scatter(offsets, maxs, s=20, color='red')
+
+        plt.xticks(x, solutions, rotation=0)
+        plt.ylabel("Agent Score")
+        plt.title("Mean / IQM / Max Across Solutions (per override)")
+        plt.axhline(0, color='gray', linewidth=0.8)
+        plt.legend(title="Override")
+        plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path)
@@ -292,66 +458,145 @@ def plot_mean_ci(metrics_dict, save_path=None):
         plt.show()
 
 def plot_boxplots_grouped(metrics_dict, indicator, save_path=None):
-    cases = sorted({
-        case
-        for sol in metrics_dict
-        for case in metrics_dict[sol].keys()
-    })
+
+    override_mode = _is_override_format(metrics_dict)
 
     solutions = sorted(metrics_dict.keys())
 
-    # Fixed consistent color map
-    color_map = {
-        "largest": "#4E79A7",
-        "smallest": "#E15759",
-        "mean": "#59A14F",
-        "random": "#F28E2B",
-        "random_pct": "#F28E2B",
-    }
-
-    n_cases = len(cases)
-    n_solutions = len(solutions)
-
-    width = 0.15
-    x = np.arange(n_solutions)
-
+    x = np.arange(len(solutions))
     plt.figure(figsize=(12, 6))
 
-    for case_idx, case in enumerate(cases):
-        positions = x + (case_idx - (n_cases - 1) / 2) * width
+    # =========================================================
+    # CASE A: DEFAULT MODE (UNCHANGED)
+    # =========================================================
+    if not override_mode:
 
-        data = []
-        for sol in solutions:
-            if case in metrics_dict[sol]:
-                data.append(metrics_dict[sol][case])
-            else:
-                data.append([])
+        cases = sorted({
+            case
+            for sol in metrics_dict
+            for case in metrics_dict[sol].keys()
+        })
 
-        bp = plt.boxplot(
-            data,
-            positions=positions,
-            widths=width,
-            patch_artist=True,
-            showfliers=True,
-        )
+        color_map = {
+            "largest": "#4E79A7",
+            "smallest": "#E15759",
+            "mean": "#59A14F",
+            "random": "#F28E2B",
+            "random_pct": "#F28E2B",
+        }
 
-        for box in bp["boxes"]:
-            box.set(facecolor=color_map[case], alpha=0.7)
+        width = 0.15
 
-        for median in bp["medians"]:
-            median.set(color="black", linewidth=1.5)
+        for case_idx, case in enumerate(cases):
+            positions = x + (case_idx - (len(cases) - 1) / 2) * width
 
-    plt.xticks(x, solutions)
-    plt.ylabel(f"{indicator.upper()} per environment")
-    plt.title("Comparison across environment sampling cases")
+            data = [
+                metrics_dict[sol].get(case, [])
+                for sol in solutions
+            ]
 
-    # Legend
-    handles = [
-        plt.Line2D([0], [0], color=color_map[c], lw=6)
-        for c in cases
-    ]
-    plt.legend(handles, cases, title="Sampling Case")
+            bp = plt.boxplot(
+                data,
+                positions=positions,
+                widths=width,
+                patch_artist=True,
+                showfliers=True,
+            )
 
+            for box in bp["boxes"]:
+                box.set(facecolor=color_map.get(case, "gray"), alpha=0.7)
+
+        plt.xticks(x, solutions)
+        plt.title("Comparison across cases")
+
+        handles = [
+            plt.Line2D([0], [0], color=color_map.get(c, "gray"), lw=6)
+            for c in cases
+        ]
+        plt.legend(handles, cases, title="Case")
+
+    # =========================================================
+    # CASE B: OVERRIDE MODE (FIXED STRUCTURE)
+    # =========================================================
+    else:
+        overrides = sorted({
+            o
+            for sol in metrics_dict
+            for case in metrics_dict[sol]
+            for o in metrics_dict[sol][case].keys()
+        })
+
+        cases = sorted({
+            case
+            for sol in metrics_dict
+            for case in metrics_dict[sol].keys()
+        })
+
+        solutions = sorted(metrics_dict.keys())
+        x = np.arange(len(solutions))
+
+        # stable colors per override
+        cmap = plt.cm.get_cmap("tab10")
+        override_color = {o: cmap(i % 10) for i, o in enumerate(overrides)}
+
+        n_overrides = len(overrides)
+        n_cases = len(cases)
+
+        # spacing between case blocks
+        case_spacing = 1.0
+
+        # width per box
+        width = 0.8 / (n_cases * n_overrides)
+
+        for case_idx, case in enumerate(cases):
+
+            # center each case block
+            case_center = (case_idx - (n_cases - 1) / 2) * case_spacing
+
+            for o_idx, override in enumerate(overrides):
+
+                # offset inside case
+                override_offset = (o_idx - (n_overrides - 1) / 2) * width * 1.3
+
+                positions = x + case_center + override_offset
+
+                data = []
+
+                for sol in solutions:
+                    sol_cases = metrics_dict[sol].get(case, {})
+
+                    if not isinstance(sol_cases, dict):
+                        data.append([])
+                        continue
+
+                    data.append(sol_cases.get(override, []))
+
+                bp = plt.boxplot(
+                    data,
+                    positions=positions,
+                    widths=width,
+                    patch_artist=True,
+                    showfliers=True,
+                )
+
+                for box in bp["boxes"]:
+                    box.set_facecolor(override_color[override])
+                    box.set_alpha(0.7)
+
+                for median in bp["medians"]:
+                    median.set_color("black")
+
+        # axis + legend
+        plt.xticks(x, solutions)
+        plt.title("Comparison across cases × overrides")
+
+        handles = [
+            plt.Line2D([0], [0], color=override_color[o], lw=6, label=o)
+            for o in overrides
+        ]
+        plt.legend(handles=handles, title="Override")
+
+    plt.ylabel(indicator.upper())
     plt.axhline(0, color="gray", linewidth=0.8)
     plt.tight_layout()
 
@@ -363,17 +608,16 @@ def plot_boxplots_grouped(metrics_dict, indicator, save_path=None):
 
 
 
-def load_env_indicators_from_csv(folder, metric_column, indicator, env_id_col="environment_ID", no_training=False):
-    if indicator == "overall":
-        raise ValueError(
-            "'overall' is not compatible with per-env best-solution stats because it does not produce one scalar per env_id."
-        )
+def _load_single_experiment(folder, metric_column, indicator,
+                            env_id_col="environment_ID",
+                            no_training=False):
+    """Original implementation for a single experiment folder."""
 
     train_solution_folder, test_solution_folder = find_latest_env_with_episodes(folder)
 
     results = {}
     per_env_results = {}
-    train_stats = None
+
     splits = [("test", test_solution_folder)]
     if not no_training:
         splits.append(("train", train_solution_folder))
@@ -396,11 +640,14 @@ def load_env_indicators_from_csv(folder, metric_column, indicator, env_id_col="e
             if len(values) == 0:
                 continue
 
-            env_score = compute_indicator(values, indicator)
-            env_values.append(env_score)
-            env_score_map[env_id] = env_score
-
-            #print(f"Computed {indicator} for env {env_id}: {env_score}")
+            if indicator == "concat":
+                # Keep every episode value
+                env_values.extend(values)
+                env_score_map[env_id] = values
+            else:
+                env_score = compute_indicator(values, indicator)
+                env_values.append(env_score)
+                env_score_map[env_id] = env_score
 
         env_values = np.asarray(env_values)
 
@@ -408,17 +655,74 @@ def load_env_indicators_from_csv(folder, metric_column, indicator, env_id_col="e
         per_env_results[split] = env_score_map
 
         print(
-            f"[{split}] envs={len(env_values)}, "
-            f"episodes_used={available_episodes}"
+            f"[{os.path.basename(folder)}][{split}] "
+            f"envs={len(env_values)}, episodes_used={available_episodes}"
         )
 
     if "test" not in results:
-        raise RuntimeError("No test metrics found")
+        raise RuntimeError(f"No test metrics found in {folder}")
+
+    return (
+        results["test"],
+        results.get("train", None),
+        per_env_results["test"],
+    )
 
 
-    return results["test"], results.get("train", None), per_env_results["test"]
+def load_env_indicators_from_csv(folder, metric_column, indicator,
+                                 env_id_col="environment_ID",
+                                 no_training=False):
+    if indicator == "overall":
+        raise ValueError(
+            "'overall' is not compatible with per-env best-solution stats because it does not produce one scalar per env_id."
+        )
 
+    # ------------------------------------------------------------------
+    # Case 1: folder itself is an experiment (current behaviour)
+    # ------------------------------------------------------------------
+    if os.path.isdir(os.path.join(folder, "checkpoints")):
+        return {
+            "default": _load_single_experiment(
+                folder,
+                metric_column,
+                indicator,
+                env_id_col,
+                no_training,
+            )
+        }
 
+    # ------------------------------------------------------------------
+    # Case 2: folder contains override_* experiments
+    # ------------------------------------------------------------------
+    override_dirs = sorted(
+        d for d in os.listdir(folder)
+        if d.startswith("override_")
+        and os.path.isdir(os.path.join(folder, d))
+    )
+
+    if not override_dirs:
+        raise RuntimeError(
+            f"Neither a checkpoints directory nor override_* directories were found in {folder}"
+        )
+
+    all_results = {}
+
+    for override in override_dirs:
+        exp_folder = os.path.join(folder, override)
+
+        if not os.path.isdir(os.path.join(exp_folder, "checkpoints")):
+            print(f"Skipping {override}: no checkpoints directory.")
+            continue
+
+        all_results[override] = _load_single_experiment(
+            exp_folder,
+            metric_column,
+            indicator,
+            env_id_col,
+            no_training,
+        )
+
+    return all_results
 
 def plot_mean_ci_by_group(
     metrics_dict,
@@ -427,21 +731,36 @@ def plot_mean_ci_by_group(
     save_path=None,
     ci=95,
 ):
+    override_mode = _is_override_format(metrics_dict)
 
     methods = list(metrics_dict.keys())
-    groups = sorted({g for m in methods for g in metrics_dict[m].keys()})
-
-    n_methods = len(methods)
-    n_groups = len(groups)
-
-    x = np.arange(n_methods)
-
-    bar_width = 0.8 / n_groups
+    x = np.arange(len(methods))
 
     fig, ax = plt.subplots(figsize=(10, 5))
-
     colors = plt.cm.tab10.colors
 
+    # ---------------------------------------------------------
+    # Collect groups depending on structure
+    # ---------------------------------------------------------
+    if not override_mode:
+        groups = sorted({
+            g
+            for m in methods
+            for g in metrics_dict[m].keys()
+        })
+    else:
+        groups = sorted({
+            g
+            for m in methods
+            for o in metrics_dict[m].values()
+            for g in o.keys()
+        })
+
+    bar_width = 0.8 / len(groups)
+
+    # ---------------------------------------------------------
+    # MAIN PLOT
+    # ---------------------------------------------------------
     for i, group in enumerate(groups):
 
         means = []
@@ -449,12 +768,29 @@ def plot_mean_ci_by_group(
 
         for method in methods:
 
-            if group not in metrics_dict[method]:
+            if not override_mode:
+                values = metrics_dict[method].get(group, None)
+
+            else:
+                # collect across overrides
+                values_list = []
+                for override in metrics_dict[method]:
+                    if group in metrics_dict[method][override]:
+                        values_list.append(
+                            np.asarray(metrics_dict[method][override][group])
+                        )
+
+                if len(values_list) == 0:
+                    values = None
+                else:
+                    values = np.concatenate(values_list)
+
+            if values is None or len(values) == 0:
                 means.append(np.nan)
                 cis.append(0)
                 continue
 
-            values = np.asarray(metrics_dict[method][group])
+            values = np.asarray(values)
 
             mean = np.mean(values)
             std = np.std(values, ddof=1)
@@ -465,7 +801,7 @@ def plot_mean_ci_by_group(
             means.append(mean)
             cis.append(ci_val)
 
-        offsets = x + (i - n_groups / 2) * bar_width + bar_width / 2
+        offsets = x + (i - len(groups) / 2) * bar_width + bar_width / 2
 
         ax.bar(
             offsets,
@@ -480,7 +816,9 @@ def plot_mean_ci_by_group(
             linewidth=0.6,
         )
 
-    # training stats overlay
+    # ---------------------------------------------------------
+    # TRAINING OVERLAY (unchanged)
+    # ---------------------------------------------------------
     if train_stats_dict is not None:
 
         for i, method in enumerate(methods):
@@ -500,6 +838,9 @@ def plot_mean_ci_by_group(
                 label="Training mean" if i == 0 else None,
             )
 
+    # ---------------------------------------------------------
+    # FORMATTING
+    # ---------------------------------------------------------
     ax.set_xticks(x)
     ax.set_xticklabels(methods)
     ax.set_ylabel(indicator.upper())
@@ -518,17 +859,68 @@ def plot_mean_ci_by_group(
         plt.show()
 
 
+def _get_overrides(all_results):
+    """
+    Find override names from the first populated result.
 
+    Results may be:
+      - completely missing: {}
+      - a dict of overrides: {"smallest": array(...), ...}
+      - a direct numpy array: array(...)
+    """
+    for env_results in all_results.values():
+        if not isinstance(env_results, dict) or len(env_results) == 0:
+            continue
+
+        for solution_results in env_results.values():
+            if not isinstance(solution_results, dict) or len(solution_results) == 0:
+                continue
+
+            for case_results in solution_results.values():
+
+                # Completely absent/empty result.
+                if case_results is None:
+                    continue
+
+                # Direct array => no overrides.
+                if isinstance(case_results, np.ndarray):
+                    return None
+
+                # Dictionary => overrides are its keys.
+                if isinstance(case_results, dict):
+                    if len(case_results) == 0:
+                        continue
+
+                    return sorted(case_results.keys())
+
+    # No populated results anywhere.
+    return None
 
 def print_all_stats(metrics_dict, ci=95):
     print("\n=== STATS OVER ALL ENV SCORES ===")
-    for sol in metrics_dict:
-        for case in metrics_dict[sol]:
-            data = metrics_dict[sol][case]
+
+    if _is_override_format(metrics_dict):
+
+        for sol in metrics_dict:
+            for override in metrics_dict[sol]:
+                data = metrics_dict[sol][override]
+
+                mean, std, ci_lower, ci_upper = compute_mean_std_bci(data, ci=ci)
+
+                print(
+                    f"{sol} | {override} | "
+                    f"Mean: {mean:.3f} | STD: {std:.3f} | "
+                    f"{ci}% CI: [{ci_lower:.3f}, {ci_upper:.3f}]"
+                )
+
+    else:
+        for sol in metrics_dict:
+            data = metrics_dict[sol]
+
             mean, std, ci_lower, ci_upper = compute_mean_std_bci(data, ci=ci)
+
             print(
-                f"{sol} | {case} | "
-                f"Mean: {mean:.3f} | STD: {std:.3f} | " 
+                f"{sol} | Mean: {mean:.3f} | STD: {std:.3f} | "
                 f"{ci}% CI: [{ci_lower:.3f}, {ci_upper:.3f}]"
             )
 
@@ -589,16 +981,13 @@ def is_normal(values):
     return w, p, f"\\checkmark (p={p:.2f})" if p > 0.05 else f"\\times (p={p:.2f})"
 
 
-
 def print_latex_extended_table(
     all_results,
     env_order,
     solution_order,
     ci=95
 ):
-
     regime_order = ["smallest", "largest", "mean", "random_pct"]
-
     regime_letters = {
         "smallest": "S",
         "largest": "L",
@@ -606,112 +995,125 @@ def print_latex_extended_table(
         "random_pct": "V",
     }
 
-    print("\n% ===== LATEX EXTENDED TABLE =====")
+    overrides = _get_overrides(all_results)
 
-    col_spec = "ll" + "c" * len(solution_order)
+    # =========================
+    # CASE 1: NO OVERRIDES
+    # =========================
+    if overrides is None:
+        overrides = ["default"]
 
-    print("\\begin{table}[ht]")
-    print("\\centering")
-    print("\\footnotesize")
-    print("\\setlength{\\tabcolsep}{4pt}")
-    print("\\renewcommand{\\arraystretch}{1.1}")
+    for override in overrides:
 
-    print(f"\\begin{{tabular}}{{{col_spec}}}")
-    print("\\toprule")
+        print(f"\n% ===== LATEX EXTENDED TABLE ({override}) =====")
 
-    header = ["Regime", "Metric"] + [
-        SOLUTION_DISPLAY_NAMES.get(s, s) for s in solution_order
-    ]
-    print(" & ".join(header) + r" \\")
+        col_spec = "ll" + "c" * len(solution_order)
 
-    print("\\midrule")
+        print("\\begin{table}[ht]")
+        print("\\centering")
+        print("\\footnotesize")
+        print("\\setlength{\\tabcolsep}{4pt}")
+        print("\\renewcommand{\\arraystretch}{1.1}")
+        print(f"\\begin{{tabular}}{{{col_spec}}}")
+        print("\\toprule")
 
-    for env in env_order:
-        env_name = format_env_name(env)
+        header = ["Regime", "Metric"] + [
+            SOLUTION_DISPLAY_NAMES.get(s, s) for s in solution_order
+        ]
+        print(" & ".join(header) + r" \\")
 
-        print(f"\\multicolumn{{{len(solution_order)+2}}}{{c}}{{\\textbf{{{env_name}}}}} \\\\")
         print("\\midrule")
 
-        for regime in regime_order:
-
-            # -------------------------
-            # normality cache
-            # -------------------------
-            norm_cache = {}
-            for sol in solution_order:
-                try:
-                    vals = np.asarray(all_results[env][sol][regime])
-                    _, p, norm = is_normal(vals)
-                    norm_cache[sol] = norm
-                except Exception:
-                    norm_cache[sol] = ""
-
-            metrics = ["Mean", "Std", "IQM", "BCI", "Normality"]
-
-            for i, ind in enumerate(metrics):
-
-                row = []
-
-                # =========================
-                # TRUE MULTIROW (NeurIPS style)
-                # =========================
-                if i == 0:
-                    row.append(f"\\multirow{{5}}{{*}}{{{regime_letters[regime]}}}")
-                else:
-                    row.append("")
-
-                row.append(r"\textit{" + ("Normal" if ind == "Normality" else ind) + "}")
-
-                for sol in solution_order:
-
-                    # -------------------------
-                    # NORMALITY ROW
-                    # -------------------------
-                    if ind == "Normality":
-                        row.append(norm_cache.get(sol, ""))
-                        continue
-
-                    # -------------------------
-                    # METRICS
-                    # -------------------------
-                    try:
-                        values = np.asarray(all_results[env][sol][regime])
-
-                        if len(values) == 0:
-                            row.append("")
-                            continue
-
-                        mean, std, iqm, (ci_low, ci_up) = mean_std_iqm_ci(values, ci=ci)
-
-                        if ind == "Mean":
-                            row.append(f"\\textbf{{{mean:.2f}}}")
-
-                        elif ind == "Std":
-                            s_low, s_high = asymmetric_std(values)
-                            row.append(f"-{s_low:.2f}/+{s_high:.2f}")
-
-                        elif ind == "IQM":
-                            row.append(f"{iqm:.2f}")
-
-                        elif ind == "BCI":
-                            row.append(f"[{ci_low:.2f}, {ci_up:.2f}]")
-
-                    except Exception:
-                        row.append("")
-
-                print(" & ".join(row) + r" \\")
-
+        for env in env_order:
+            env_name = format_env_name(env)
+            print(f"\\multicolumn{{{len(solution_order)+2}}}{{c}}{{\\textbf{{{env_name}}}}} \\\\")
             print("\\midrule")
 
+            for regime in regime_order:
+
+                norm_cache = {}
+
+                for sol in solution_order:
+                    try:
+                        vals = get_override_values(
+                            all_results.get(env, {}).get(sol, {}).get(regime),
+                            override,
+                        )
+                        vals = np.asarray(vals)
+
+                        if len(vals) == 0:
+                            norm_cache[sol] = ""
+                            continue
+
+                        _, p, norm = is_normal(vals)
+                        norm_cache[sol] = norm
+
+                    except Exception:
+                        norm_cache[sol] = ""
+
+                metrics = ["Mean", "Std", "IQM", "BCI", "Normality"]
+
+                for i, ind in enumerate(metrics):
+
+                    row = []
+
+                    if i == 0:
+                        row.append(f"\\multirow{{5}}{{*}}{{{regime_letters[regime]}}}")
+                    else:
+                        row.append("")
+
+                    row.append(r"\textit{" + ("Normal" if ind == "Normality" else ind) + "}")
+
+                    for sol in solution_order:
+
+                        if ind == "Normality":
+                            row.append(norm_cache.get(sol, ""))
+                            continue
+
+                        try:
+                            vals = get_override_values(
+                                all_results.get(env, {}).get(sol, {}).get(regime),
+                                override,
+                            )
+                            vals = np.asarray(vals)
+
+                            if len(vals) == 0:
+                                row.append("")
+                                continue
+
+                            mean, std, iqm, (ci_low, ci_up) = mean_std_iqm_ci(vals, ci=ci)
+
+                            if ind == "Mean":
+                                row.append(f"\\textbf{{{mean:.2f}}}")
+
+                            elif ind == "Std":
+                                s_low, s_high = asymmetric_std(vals)
+                                row.append(f"-{s_low:.2f}/+{s_high:.2f}")
+
+                            elif ind == "IQM":
+                                row.append(f"{iqm:.2f}")
+
+                            elif ind == "BCI":
+                                row.append(f"[{ci_low:.2f}, {ci_up:.2f}]")
+
+                        except Exception:
+                            row.append("")
+
+                    print(" & ".join(row) + r" \\")
+
+                print("\\midrule")
+
         print("\\bottomrule")
+        print("\\end{tabular}")
 
-    print("\\end{tabular}")
+        if override != "default":
+            print(f"\\caption{{Extended results (override={override})}}")
+        else:
+            print("\\caption{Extended results}")
+        print("\\label{tab:generalization_extended_" + override + "}")
 
-    print("\\caption{Extended generalization results with confidence intervals and Shapiro-Wilk normality checks.}")
-    print("\\label{tab:generalization_extended}")
-    print("\\end{table}")
-
-    print("% ===== END LATEX EXTENDED TABLE =====\n")
+        print("\\end{table}")
+        print("% ===== END TABLE =====\n")
 
 def asymmetric_std(values, low=16, high=84):
     """
@@ -749,35 +1151,81 @@ def mean_std_iqm_ci(values, ci=95):
     ci_low, ci_up = bootstrap_ci(values, 10000, ci=ci)
     return mean, std, iqm, (ci_low, ci_up)
 
-def build_latex_table_data(all_results, env_order, solution_order, case_order=("smallest", "largest")):
+def build_latex_table_data(
+    all_results,
+    env_order,
+    solution_order,
+    case_order=("smallest", "largest")
+):
     """
-    all_results structure:
-        all_results[env_name][solution_name][case_name] = np.array([...])
-
     Returns:
-        table_data[solution][env][case] = (mean, std)
+        table_data[solution][env][case][override] = (mean, std)
     """
+
     table_data = {}
 
     for sol in solution_order:
         table_data[sol] = {}
+
         for env in env_order:
             table_data[sol][env] = {}
+
             for case in case_order:
+
                 values = (
                     all_results.get(env, {})
                     .get(sol, {})
                     .get(case, None)
                 )
 
+                # -------------------------
+                # NO DATA
+                # -------------------------
                 if values is None or len(values) == 0:
-                    table_data[sol][env][case] = (np.nan, np.nan)
+                    table_data[sol][env][case] = {
+                        "default": (np.nan, np.nan)
+                    }
+                    continue
+
+                # -------------------------
+                # OVERRIDE FORMAT
+                # -------------------------
+                if isinstance(values, dict):
+
+                    table_data[sol][env][case] = {}
+
+                    for override, v in values.items():
+
+                        v = np.asarray(v)
+
+                        if len(v) == 0:
+                            continue
+
+                        table_data[sol][env][case][override] = (
+                            compute_indicator(v, "iqm"),
+                            np.std(v, ddof=1) if len(v) > 1 else 0.0
+                        )
+
+                # -------------------------
+                # OLD FORMAT
+                # -------------------------
                 else:
-                    table_data[sol][env][case] = (compute_indicator(values, "iqm"), np.std(values, ddof=1) if len(values) > 1 else 0.0)
+                    v = np.asarray(values)
+
+                    if len(v) == 0:
+                        table_data[sol][env][case] = {
+                            "default": (np.nan, np.nan)
+                        }
+                    else:
+                        table_data[sol][env][case] = {
+                            "default": (
+                                compute_indicator(v, "iqm"),
+                                np.std(v, ddof=1) if len(v) > 1 else 0.0
+                            )
+                        }
 
     return table_data
 
-import math
 
 def truncate(x, decimals=2):
     if np.isnan(x):
@@ -790,12 +1238,19 @@ NO_CONV_THRESHOLD = 0.05
 
 def print_latex_table(
     all_results,
-    all_train_stats,  # NEW
+    all_train_stats,
     env_order,
     solution_order,
+    no_training,
     case_order=("smallest", "mean", "largest", "random_pct"),
     precision=2,
+
 ):
+
+
+    show_delta = not no_training
+
+
     case_labels = {
         "smallest": "S",
         "largest": "L",
@@ -803,116 +1258,471 @@ def print_latex_table(
         "random_pct": "V",
     }
 
-    table_data = build_latex_table_data(
-        all_results=all_results,
-        env_order=env_order,
-        solution_order=solution_order,
-        case_order=case_order,
-    )
+    overrides = _get_overrides(all_results)
+    if overrides is None:
+        overrides = ["default"]
 
-    train_data = build_latex_table_data(
-        all_results=all_train_stats,
-        env_order=env_order,
-        solution_order=solution_order,
-        case_order=case_order,
-    )
+    for override in overrides:
 
-    # ---- compute best per env ----
-    print("TABLE DATA (mean IQM):", table_data)
-    best_per_env = {}
-    for env in env_order:
-        best_val = -np.inf
-        for sol in solution_order:
-            for case in case_order:
-                val, _ = table_data[sol][env][case]
-                if not np.isnan(val) and val > best_val:
-                    best_val = val
-        best_per_env[env] = best_val
+        if override != "default":
+            print(f"\n% ===== LATEX TABLE (override={override}) =====")
+        else:
+            print(f"\n% ===== LATEX TABLE =====")
 
-    # Header (ADD +1 column per env for GAP)
-    col_spec = "l|" + "|".join(["".join(["c"] * len(case_order)) + ":c" for _ in env_order])
-    print("\n% ===== LATEX TABLE =====")
-    print(f"\\begin{{tabular}}{{{col_spec}}}")
-    print("\\toprule")
+        # NOTE: table_data still needs override-aware access
+        # so we patch access inline below instead of rewriting everything
 
-    # Env header
-    env_header_parts = []
-    for i, env in enumerate(env_order):
-        suffix = "|" if i < len(env_order) - 1 else ""
-        env_header_parts.append(
-            f"& \\multicolumn{{{len(case_order)+1}}}{{c{suffix}}}{{{format_env_name(env)}}}"
-        )
-    print(" ".join(env_header_parts) + r" \\")
-
-    # Subheader
-    subheader = ["Method"]
-    for _env in env_order:
-        for case in case_order:
-            subheader.append(case_labels.get(case, case))
-        subheader.append("\(\\Delta\\)")
-    print(" & ".join(subheader) + r" \\")
-    print("\\midrule")
-
-    # Rows
-    for sol in solution_order:
-        display_name = SOLUTION_DISPLAY_NAMES.get(sol, sol)
-        cells = [display_name]
+        best_per_env = {}
 
         for env in env_order:
-            gaps = []
+            best_val = -np.inf
+
+            for sol in solution_order:
+                for case in case_order:
+
+                    vals = all_results.get(env, {}).get(sol, {}).get(case, {})
+                    if isinstance(vals, dict):
+                        vals = vals.get(override, None)
+
+                    if vals is None:
+                        continue
+
+                    vals = np.asarray(vals)
+                    if len(vals) == 0:
+                        continue
+
+                    val = compute_indicator(vals, "iqm")
+
+                    if not np.isnan(val) and val > best_val:
+                        best_val = val
+
+            best_per_env[env] = best_val
+
+        delta_col = ":c" if show_delta else ""
+
+        col_spec = "l|" + "|".join(
+            ["".join(["c"] * len(case_order)) + delta_col for _ in env_order]
+        )
+
+        print("\\begin{tabular}{" + col_spec + "}")
+        print("\\toprule")
+
+        env_header_parts = []
+        for i, env in enumerate(env_order):
+            suffix = "|" if i < len(env_order) - 1 else ""
+            n_cols = len(case_order) + (1 if show_delta else 0)
+
+            env_header_parts.append(
+                f"& \\multicolumn{{{n_cols}}}{{c{suffix}}}{{{format_env_name(env)}}}"
+            )
+        print(" ".join(env_header_parts) + r" \\")
+
+        subheader = ["Method"]
+
+        for _ in env_order:
+            for case in case_order:
+                subheader.append(case_labels.get(case, case))
+
+            if show_delta:
+                subheader.append("\\(\\Delta\\)")
+        print(" & ".join(subheader) + r" \\")
+
+        print("\\midrule")
+
+        for sol in solution_order:
+
+            display_name = SOLUTION_DISPLAY_NAMES.get(sol, sol)
+            cells = [display_name]
+
+            for env in env_order:
+                gaps = []
+
+                for case in case_order:
+
+                    vals = all_results.get(env, {}).get(sol, {}).get(case, {})
+                    if isinstance(vals, dict):
+                        vals = vals.get(override, None)
+
+                    if vals is None:
+                        cells.append("")
+                        continue
+
+                    vals = np.asarray(vals)
+                    test_val = compute_indicator(vals, "iqm")
+
+                    train_vals = all_train_stats.get(env, {}).get(sol, {}).get(case, {})
+                    if isinstance(train_vals, dict):
+                        train_vals = train_vals.get(override, None)
+
+                    if train_vals is not None:
+                        train_vals = np.asarray(train_vals)
+                    else:
+                        train_vals = None
+
+                    if show_delta and train_vals is not None and len(train_vals) > 0:
+                        gaps.append(test_val - np.nanmean(train_vals))
+
+                    if np.isnan(test_val):
+                        cell_str = ""
+                    else:
+                        val = truncate(test_val, precision)
+                        cell_str = f"{val:.{precision}f}"
+
+                    EPS = 1e-6
+                    if test_val >= best_per_env[env] - EPS:
+                        cell_str = f"\\bestblock{{{cell_str}}}"
+
+                    cells.append(cell_str)
+
+                # -----------------------------------------------------
+                # Δ COLUMN (ONLY IF TRAINING EXISTS)
+                # -----------------------------------------------------
+                if show_delta:
+                    avg_gap = np.nanmean(gaps)
+                    gap_str = "" if np.isnan(avg_gap) else f"{avg_gap:+.{precision}f}"
+                    cells.append(gap_str)
+
+            print(" & ".join(cells) + r" \\")
+
+        print("\\bottomrule")
+        print("\\end{tabular}")
+
+        if override != "default":
+            print(f"\\caption{{Comparison table (override={override})}}")
+        else:
+            print("\\caption{Comparison table}")
+        print("\\label{tab:comparison_" + override + "}")
+
+def build_table(
+    all_results,
+    all_train_stats,
+    env_order,
+    solution_order,
+    no_training,
+    case_order=("smallest", "mean", "largest", "random_pct"),
+    precision=2,
+):
+    show_delta = not no_training
+
+    case_labels = {
+        "smallest": "S",
+        "largest": "L",
+        "mean": "M",
+        "random_pct": "V",
+    }
+
+    overrides = _get_overrides(all_results)
+    if overrides is None:
+        overrides = ["default"]
+
+    tables = {}
+
+    for override in overrides:
+
+        # --------------------------------------------------
+        # Best IQM per environment
+        # --------------------------------------------------
+        best_per_env = {}
+
+        for env in env_order:
+            best_val = -np.inf
+
+            for sol in solution_order:
+                for case in case_order:
+
+                    vals = all_results.get(env, {}).get(sol, {}).get(case, {})
+                    if isinstance(vals, dict):
+                        vals = vals.get(override)
+
+                    if vals is None:
+                        continue
+
+                    vals = np.asarray(vals)
+                    if len(vals) == 0:
+                        continue
+
+                    val = compute_indicator(vals, "iqm")
+
+                    if not np.isnan(val):
+                        best_val = max(best_val, val)
+
+            best_per_env[env] = best_val
+
+        # --------------------------------------------------
+        # Headers
+        # --------------------------------------------------
+
+        headers = ["Method"]
+
+        for env in env_order:
+            prefix = format_env_name(env)
 
             for case in case_order:
-                test_val, _ = table_data[sol][env][case]
+                headers.append(f"{prefix}-{case_labels[case]}")
 
-                if case in all_train_stats.get(env, {}).get(sol, {}):
-                    train_vals = np.asarray(all_train_stats[env][sol][case])
-                else:
-                    train_vals = None
-                # if case == "random_pct":
-                #     #print("KEYS IN ", all_train_stats[env][sol].keys())
-                #     train_vals_reference = np.asarray(all_train_stats[env][sol]["smallest"])
-                # else:
-                #     train_vals_reference = None
+            if show_delta:
+                headers.append(f"{prefix}-Δ")
 
-                #print("TRAIN VALS FOR", sol, env, case, ":", train_vals)
-                if train_vals is not None and len(train_vals) > 0 and not np.isnan(test_val):
-                    gap = test_val - np.nanmean(train_vals)
-                    gaps.append(gap)
+        # --------------------------------------------------
+        # Rows
+        # --------------------------------------------------
 
-                if np.isnan(test_val):
-                    cell_str = ""
-                else:
-                    val = truncate(test_val, precision)
-                    cell_str = f"{val:.{precision}f}"
+        rows = []
 
-                    #print("CASE:", case, "ENV:", env)
-                    #print("TRAIN VALS FOR", sol, env, case, ":", train_vals)
-                    # TO DO READD
-                    #cell_str += format_failure_rate(train_vals, NO_CONV_THRESHOLD, reference=train_vals_reference)
+        for sol in solution_order:
 
-                EPS = 1e-6
-                if not np.isnan(test_val) and test_val >= best_per_env[env] - EPS:
-                    cell_str = f"\\bestblock{{{cell_str}}}"
+            display_name = SOLUTION_DISPLAY_NAMES.get(sol, sol)
+            row = [display_name]
 
-                cells.append(cell_str)
+            for env in env_order:
 
-            # GAP column
-            avg_gap = np.nanmean(gaps)
-            if np.isnan(avg_gap):
-                gap_str = ""
-            else:
-                val = truncate(avg_gap, precision)
-                gap_str = f"{val:+.{precision}f}"
+                gaps = []
+
+                for case in case_order:
+
+                    vals = all_results.get(env, {}).get(sol, {}).get(case, {})
+
+                    if isinstance(vals, dict):
+                        vals = vals.get(override)
+
+                    if vals is None:
+                        row.append("")
+                        continue
+
+                    vals = np.asarray(vals)
+
+                    if len(vals) == 0:
+                        row.append("")
+                        continue
+
+                    test_val = compute_indicator(vals, "iqm")
+
+                    train_vals = (
+                        all_train_stats
+                        .get(env, {})
+                        .get(sol, {})
+                        .get(case, {})
+                    )
+
+                    if isinstance(train_vals, dict):
+                        train_vals = train_vals.get(override)
+
+                    if train_vals is not None:
+                        train_vals = np.asarray(train_vals)
+
+                    if (
+                        show_delta
+                        and train_vals is not None
+                        and len(train_vals) > 0
+                    ):
+                        gaps.append(test_val - np.nanmean(train_vals))
+
+                    if np.isnan(test_val):
+                        cell = ""
+                    else:
+                        cell = f"{truncate(test_val, precision):.{precision}f}"
+
+                        if test_val >= best_per_env[env] - 1e-6:
+                            cell = f"*{cell}*"
+
+                    row.append(cell)
+
+                if show_delta:
+                    avg_gap = np.nanmean(gaps)
+                    row.append("" if np.isnan(avg_gap) else f"{avg_gap:+.{precision}f}")
+
+            rows.append(row)
+
+        tables[override] = (headers, rows)
+
+    return tables
 
 
-            cells.append(gap_str)
+def build_extended_table(
+    all_results,
+    all_train_stats,
+    env_order,
+    solution_order,
+    no_training,
+    case_order=("smallest", "mean", "largest", "random_pct"),
+    precision=2,
+):
+    show_delta = not no_training
 
-        print(" & ".join(cells) + r" \\")
+    case_labels = {
+        "smallest": "S",
+        "largest": "L",
+        "mean": "M",
+        "random_pct": "V",
+    }
 
-    print("\\bottomrule")
-    print("\\end{tabular}")
-    print("% ===== END LATEX TABLE =====\n")
+    overrides = _get_overrides(all_results)
+    if overrides is None:
+        overrides = ["default"]
 
+    tables = {}
+
+    for override in overrides:
+
+        # --------------------------------------------------
+        # Best IQM per environment
+        # --------------------------------------------------
+        best_per_env = {}
+
+        for env in env_order:
+            best_val = -np.inf
+
+            for sol in solution_order:
+                for case in case_order:
+
+                    vals = all_results.get(env, {}).get(sol, {}).get(case, {})
+                    if isinstance(vals, dict):
+                        vals = vals.get(override)
+
+                    if vals is None:
+                        continue
+
+                    vals = np.asarray(vals)
+                    if len(vals) == 0:
+                        continue
+
+                    val = compute_indicator(vals, "iqm")
+
+                    if not np.isnan(val):
+                        best_val = max(best_val, val)
+
+            best_per_env[env] = best_val
+
+        # --------------------------------------------------
+        # Headers
+        # --------------------------------------------------
+
+        headers = ["Method"]
+
+        for env in env_order:
+            prefix = format_env_name(env)
+
+            for case in case_order:
+                headers.append(f"{prefix}-{case_labels[case]}")
+
+            if show_delta:
+                headers.append(f"{prefix}-Δ")
+
+        # --------------------------------------------------
+        # Rows
+        # --------------------------------------------------
+
+        rows = []
+
+        for sol in solution_order:
+
+            display_name = SOLUTION_DISPLAY_NAMES.get(sol, sol)
+            row = [display_name]
+
+            for env in env_order:
+
+                gaps = []
+
+                for case in case_order:
+
+                    vals = all_results.get(env, {}).get(sol, {}).get(case, {})
+
+                    if isinstance(vals, dict):
+                        vals = vals.get(override)
+
+                    if vals is None:
+                        row.append("")
+                        continue
+
+                    vals = np.asarray(vals)
+
+                    if len(vals) == 0:
+                        row.append("")
+                        continue
+
+                    test_val = compute_indicator(vals, "iqm")
+
+                    train_vals = (
+                        all_train_stats
+                        .get(env, {})
+                        .get(sol, {})
+                        .get(case, {})
+                    )
+
+                    if isinstance(train_vals, dict):
+                        train_vals = train_vals.get(override)
+
+                    if train_vals is not None:
+                        train_vals = np.asarray(train_vals)
+
+                    if (
+                        show_delta
+                        and train_vals is not None
+                        and len(train_vals) > 0
+                    ):
+                        gaps.append(test_val - np.nanmean(train_vals))
+
+                    if len(vals) == 0:
+                        row.append("")
+                        continue
+
+                    cell = summarize_distribution(vals, precision)
+
+                    # still highlight the best IQM
+                    iqm = compute_indicator(vals, "iqm")
+                    if iqm >= best_per_env[env] - 1e-6:
+                        cell = "*\n" + cell
+
+                    row.append(cell)
+
+                if show_delta:
+                    avg_gap = np.nanmean(gaps)
+                    row.append("" if np.isnan(avg_gap) else f"{avg_gap:+.{precision}f}")
+
+            rows.append(row)
+
+        tables[override] = (headers, rows)
+
+    return tables
+
+def comparison_solution_name(sol, revisiting):
+    suffix = "revisiting" if revisiting else "non revisiting"
+
+    display_name = SOLUTION_DISPLAY_NAMES.get(sol, sol)
+
+    if sol == "projection":
+        display_name = "Projection"
+
+    return f"{display_name} ({suffix})"
+
+def summarize_distribution(values, precision=2, ci=95):
+    values = np.asarray(values)
+
+    if len(values) == 0:
+        return ""
+
+    iqm = compute_indicator(values, "iqm")
+    mean = np.mean(values)
+    std = np.std(values, ddof=1) if len(values) > 1 else 0.0
+
+    ci_low, ci_up = bootstrap_ci(values, 10000, ci)
+
+    p25 = np.percentile(values, 25)
+    minimum = np.min(values)
+
+    # mean of worst 10%
+    n = max(1, int(np.ceil(0.10 * len(values))))
+    worst10 = np.mean(np.sort(values)[:n])
+
+    return "\n".join([
+        f"IQM : {iqm:.{precision}f}",
+        f"μ   : {mean:.{precision}f}",
+        f"STD : {std:.{precision}f}",
+        f"BCI : [{ci_low:.{precision}f}, {ci_up:.{precision}f}]",
+        f"P25 : {p25:.{precision}f}",
+        f"W10 : {worst10:.{precision}f}",
+        f"Min : {minimum:.{precision}f}",
+    ])
 
 def format_failure_rate(train_values, threshold=0.05, reference=None):
     """
@@ -1012,7 +1822,7 @@ def main():
     )
     parser.add_argument(
         "-i", "--indicator",
-        choices=["mean", "max", "min", "iqm", "overall"],
+        choices=["mean", "max", "min", "iqm", "overall", "concat"],
         default="mean",
         help="Indicator computed per environment before aggregation"
     )
@@ -1028,13 +1838,6 @@ def main():
             "GO_discrete_M",
             "iterative",
             "projection",
-
-
-            #
-            #
-            # "projection_approximate",
-            # "projection_sample",
-            # "projection_pca",
         ],
         help="List of solution types to compare",
     )
@@ -1042,8 +1845,16 @@ def main():
         "--cases",
         nargs="+",
         choices=["largest", "smallest", "mean", "random", "random_pct"],
-        default=["smallest", "largest"],
+        default=["smallest", "mean", "largest", "random_pct"],
         help="Environment sampling cases to include",
+    )
+    parser.add_argument(
+        "--revisiting_comparison",
+        action="store_true",
+        help=(
+            "Compare non_revisiting and revisiting experiments. "
+            "Missing revisiting folders are skipped."
+        ),
     )
     parser.add_argument(
         "--check_normality",
@@ -1053,7 +1864,7 @@ def main():
 
     parser.add_argument(
         "--print_format",
-        choices=["text", "latex", "latex_extended", "both"],
+        choices=["text", "latex", "latex_extended", "both", "ascii", "ascii_extended"],
         default="text",
         help="How to print the summary results"
     )
@@ -1076,6 +1887,21 @@ def main():
     solution_order = args.solutions
     case_order = args.cases
 
+    # This is ONLY the order/names used by the output tables.
+    # solution_order MUST remain the real filesystem folder names.
+    if args.revisiting_comparison:
+        table_solution_order = []
+
+        for sol in solution_order:
+            table_solution_order.append(
+                comparison_solution_name(sol, False)
+            )
+            table_solution_order.append(
+                comparison_solution_name(sol, True)
+            )
+    else:
+        table_solution_order = solution_order
+
     # all_results[env][solution][case] = np.array(...)
     all_results = {}
     all_metrics_by_env = {}
@@ -1086,47 +1912,144 @@ def main():
         all_metrics_by_env[env_name] = {}
         all_train_stats[env_name] = {}
 
-        for sol in solution_order:
-            solution_root = os.path.join(
-                script_dir, "..", "agents", args.logs_folder, env_name, sol
-            )
+        if args.revisiting_comparison:
+            comparison_groups = [
+                ("non revisiting", "non_revisiting"),
+                ("revisiting", "revisiting"),
+            ]
+        else:
+            comparison_groups = [
+                (None, None),
+            ]
 
-            if not os.path.isdir(solution_root):
-                print(f"Skipping missing solution folder: {solution_root}")
-                continue
+        for group_label, group_folder in comparison_groups:
 
-            selected_case_folders = select_best_case_folders(solution_root, case_order)
+            for sol in solution_order:
 
-            if not selected_case_folders:
-                print(f"No valid case folders found for env='{env_name}', solution='{sol}'")
-                continue
-
-            all_results[env_name][sol] = {}
-            all_metrics_by_env[env_name][sol] = {}
-            all_train_stats[env_name][sol] = {}
-
-            for case_name, case_folder in selected_case_folders.items():
-                full_case_path = os.path.join(solution_root, case_folder)
-
-                try:
-                    env_metrics, train_metrics, env_score_map = load_env_indicators_from_multiple_runs(
-                        full_case_path,
-                        metric_column=env_registry[env_name]["score_key"],
-                        indicator=args.indicator,
-                        env_id_col="environment_ID",
-                        no_training=args.no_training,
+                # IMPORTANT: sol is the REAL folder name here
+                if group_folder is None:
+                    solution_root = os.path.join(
+                        script_dir,
+                        "..",
+                        "agents",
+                        args.logs_folder,
+                        env_name,
+                        sol,
+                    )
+                else:
+                    solution_root = os.path.join(
+                        script_dir,
+                        "..",
+                        "agents",
+                        args.logs_folder,
+                        group_folder,
+                        env_name,
+                        sol,
                     )
 
-                    all_results[env_name][sol][case_name] = env_metrics
-                    all_metrics_by_env[env_name][sol][case_name] = env_score_map
-                    if not args.no_training:
-                        all_train_stats[env_name][sol][case_name] = train_metrics
+                if not os.path.isdir(solution_root):
                     print(
-                        f"Loaded env={env_name} | sol={sol} | case={case_name} | n={len(env_metrics)}"
+                        f"Skipping missing solution folder: "
+                        f"{solution_root}"
+                    )
+                    continue
+
+                # Name ONLY for the output/table
+                if group_label is None:
+                    result_sol_name = sol
+                else:
+                    result_sol_name = comparison_solution_name(
+                        sol,
+                        group_label == "revisiting",
                     )
 
-                except Exception as e:
-                    print(f"Warning for env={env_name} / sol={sol} / case={case_name}: {e}")
+                selected_case_folders = select_best_case_folders(
+                    solution_root,
+                    case_order,
+                )
+
+                if not selected_case_folders:
+                    print(
+                        f"No valid case folders found for "
+                        f"env='{env_name}', solution='{sol}', "
+                        f"group='{group_label}'"
+                    )
+                    continue
+
+                all_results[env_name][result_sol_name] = {}
+                all_metrics_by_env[env_name][result_sol_name] = {}
+                all_train_stats[env_name][result_sol_name] = {}
+
+                for case_name, case_folder in selected_case_folders.items():
+                    full_case_path = os.path.join(
+                        solution_root,
+                        case_folder,
+                    )
+
+                    try:
+                        override_outputs = load_env_indicators_from_multiple_runs(
+                            full_case_path,
+                            metric_column=env_registry[env_name]["score_key"],
+                            indicator=args.indicator,
+                            env_id_col="environment_ID",
+                            no_training=args.no_training,
+                        )
+
+                        all_results[env_name][result_sol_name][case_name] = {}
+                        all_metrics_by_env[env_name][result_sol_name][case_name] = {}
+                        all_train_stats[env_name][result_sol_name][case_name] = {}
+
+                        if (
+                                len(override_outputs) == 1
+                                and "default" in override_outputs
+                        ):
+                            (
+                                env_metrics,
+                                train_metrics,
+                                env_score_map,
+                            ) = override_outputs["default"]
+
+                            all_results[env_name][result_sol_name][case_name] = env_metrics
+                            all_metrics_by_env[env_name][result_sol_name][case_name] = env_score_map
+
+                            if not args.no_training:
+                                all_train_stats[env_name][result_sol_name][case_name] = train_metrics
+
+                            print(
+                                f"Loaded env={env_name} | "
+                                f"sol={result_sol_name} | "
+                                f"case={case_name} | "
+                                f"n={len(env_metrics)}"
+                            )
+
+                        else:
+                            for override_name, (
+                                    env_metrics,
+                                    train_metrics,
+                                    env_score_map,
+                            ) in override_outputs.items():
+
+                                all_results[env_name][result_sol_name][case_name][override_name] = env_metrics
+                                all_metrics_by_env[env_name][result_sol_name][case_name][override_name] = env_score_map
+
+                                if not args.no_training:
+                                    all_train_stats[env_name][result_sol_name][case_name][override_name] = train_metrics
+
+                                print(
+                                    f"Loaded env={env_name} | "
+                                    f"sol={result_sol_name} | "
+                                    f"case={case_name} | "
+                                    f"override={override_name} | "
+                                    f"n={len(env_metrics)}"
+                                )
+
+                    except Exception as e:
+                        print(
+                            f"Warning for env={env_name} / "
+                            f"sol={sol} / "
+                            f"group={group_label} / "
+                            f"case={case_name}: {e}"
+                        )
 
     # Optional plotting: only when exactly one environment
     if args.plot != "none":
@@ -1161,7 +2084,7 @@ def main():
         print_latex_extended_table(
             all_results=all_results,
             env_order=env_order,
-            solution_order=solution_order,
+            solution_order=table_solution_order,
             ci=95
         )
         if not args.no_training:
@@ -1169,7 +2092,7 @@ def main():
             print_latex_extended_table(
                 all_results=all_train_stats,
                 env_order=env_order,
-                solution_order=solution_order,
+                solution_order=table_solution_order,
                 ci=95
             )
 
@@ -1180,19 +2103,37 @@ def main():
             all_results=all_results,
             all_train_stats=all_train_stats,
             env_order=env_order,
-            solution_order=solution_order,
+            solution_order=table_solution_order,
+            no_training=args.no_training,
             case_order=case_order,
             precision=2,
         )
-        # if not args.no_training:
-        #      print_latex_table(
-        #          all_results=all_train_stats,
-        #          env_order=env_order,
-        #          solution_order=solution_order,
-        #          case_order=("train",),
-        #          precision=2,
-        #      )
+    if args.print_format in ["ascii", "both"]:
+        tables = build_table(
+            all_results=all_results,
+            all_train_stats=all_train_stats,
+            env_order=env_order,
+            solution_order=table_solution_order,
+            no_training=args.no_training,
+            case_order=case_order,
+            precision=2,
+        )
+        for override, (headers, rows) in tables.items():
+            print(tabulate(rows, headers=headers, tablefmt="grid"))
 
+    if args.print_format == "ascii_extended":
+        tables = build_extended_table(
+            all_results=all_results,
+            all_train_stats=all_train_stats,
+            env_order=env_order,
+            solution_order=table_solution_order,
+            no_training=args.no_training,
+            case_order=case_order,
+            precision=2,
+        )
+
+        for override, (headers, rows) in tables.items():
+            print(tabulate(rows, headers=headers, tablefmt="grid"))
     if args.check_normality:
         check_normality(all_results)
 

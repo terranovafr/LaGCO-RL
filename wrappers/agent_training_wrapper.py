@@ -17,8 +17,8 @@ from torch_geometric.utils import from_networkx
 from itertools import product
 from utils.model import Graph, Node, Edge, Path, Object, SubGraph, NonExistingEdge, Function, ActionSpace
 from wrappers.wrapper import GraphWrapper
-from utils.distance_utils import sample_farthest_k_points
-from utils.pooling_functions import ConcatPooling
+from utils.distance_utils import sample_farthest_k_points, gaussian_distance,wasserstein_distance,mahalanobis_distance, energy_distance
+from utils.pooling_functions import ConcatPooling, SumPooling, MeanPooling, MaxPooling, MinPooling
 from utils.heuristics import get_function_from_protoknnconfig
 from utils.hash_utils import is_hashable, make_hashable
 from utils.plot_utils import plot_umap_actions, compute_space_cmp_stats
@@ -60,6 +60,7 @@ class AgentTrainingWrapper(GraphWrapper):
                  pca_percentage_target=1,
                  pca_minimum_without_loss=False,
                  remove_non_valid_actions=False,
+                 projection_agent=None,
                  sample_subset_actions=100,
                  sample_subset_actions_strategy="random",  # "random" or "farthest"
                  plot_action_space=False,
@@ -73,6 +74,8 @@ class AgentTrainingWrapper(GraphWrapper):
                  concatenate_actions_observation=False,
                  use_feature_vectors=False,
                  distance_computation=False,
+                 use_random_embeddings=False,
+                 random_embedding_seed=42,
                  **config):
         super().__init__(env, **config)
         self.gnn_models = gnn_models
@@ -81,18 +84,20 @@ class AgentTrainingWrapper(GraphWrapper):
         self.algorithm_type = algorithm_type
         self.GNN_observations = GNN_observations
         self.logs_folder = logs_folder
-
+        self.no_index_metrics = {"manhattan", "chebyshev"}
         self.node_embeddings = {}
-
+        self.std_node_embeddings = {} # only for vgae
+        self.std_actions = {}
         self.gae_model_type = gae_model_type
         self.vgae_projection = vgae_projection
         self.use_feature_vectors = use_feature_vectors
         self.distance_computation = distance_computation
-
+        self.projection_agent = projection_agent
         self.action_lower_bounds = None
         self.action_upper_bounds = None
         self.continuous_action_pca = None
         self.discrete_actions = None
+        self.index = None
 
         self._new_action_entries_since_save = 0
         self._current_action_cache_file = None
@@ -122,12 +127,23 @@ class AgentTrainingWrapper(GraphWrapper):
         self.concatenate_actions_observation = concatenate_actions_observation # whether to concatenate action vectors in the observation vector (only if sample_subset_actions > 0, which means number of actions has a maximum)
         self.action_candidates = {}
 
+        self.use_random_embeddings = use_random_embeddings
+        self.random_embedding_seed = random_embedding_seed
+        self.random_node_embeddings = {}
+
         self.observation_space_creation_time = 0
         self.action_space_creation_time = 0
         self.action_set_construction_time = 0
         self.attribute_encoding_time = 0
         self.graph_encoding_time = 0
         self.action_mapping_time = 0
+        if self.vgae_projection == "distribution" and self.distance_metric not in ["gaussian", "energy", "wasserstein", "mahalanobis"] and self.gae_model_type == 'vgae':
+            self.distance_metric = "gaussian"
+            self.norm_action_space = False
+            self.distance_computation = 'cpu'
+        elif self.vgae_projection == "distribution" and self.gae_model_type == 'vgae':
+            self.norm_action_space = False
+            self.distance_computation = 'cpu'
 
         Gs = self.env.get_graphs()
         encoded_Gs = {}
@@ -144,7 +160,7 @@ class AgentTrainingWrapper(GraphWrapper):
             self.action_space = env.action_space
         elif self.algorithm_type == "projection" or self.algorithm_type == "iterative":
             self.action_set, self.action_lower_bounds, self.action_upper_bounds = self.create_continuous_action_space(encoded_Gs)
-            self.action_set_reversed = {tuple(v): k for k, v in self.action_set.items()} # used to retrieve action discrete ID tuple
+            #self.action_set_reversed = {tuple(np.round(v,6)): k for k, v in self.action_set.items()} # used to retrieve action discrete ID tuple
             self.define_action_space(self.action_lower_bounds, self.action_upper_bounds, Gs, self.epsilon_lower, self.epsilon_upper)
         self.define_observation_space()
 
@@ -162,6 +178,10 @@ class AgentTrainingWrapper(GraphWrapper):
     def set_continuous_pca_object(self, pca):
         self.pca_object = pca
         self.perform_pca_reduction()
+
+    @property
+    def action_set_reversed(self):
+        return {tuple(np.round(v, 6)): k for k, v in self.action_set.items()}
 
     def perform_pca_reduction(self):
         # reduction of action space dimensions via PCA, applied if pca_percentage_target < 1.0 or pca_minimum_without_loss is True
@@ -204,7 +224,7 @@ class AgentTrainingWrapper(GraphWrapper):
                 # compute new action lower and upper bounds as arrays
                 self.action_lower_bounds = -3 * np.ones_like(mean)
                 self.action_upper_bounds = 3 * np.ones_like(mean)
-            self.action_set_reversed = {tuple(v): k for k, v in self.action_set.items()}
+            #self.action_set_reversed = {tuple(np.round(v, 6)): k for k, v in self.action_set.items()}
             self.action_space = spaces.Box(low=self.action_lower_bounds, high=self.action_upper_bounds, dtype=np.float32)
 
     def set_discrete_actions(self, discrete_action_list):
@@ -213,52 +233,83 @@ class AgentTrainingWrapper(GraphWrapper):
             for discrete_action in self.env.discrete_actions:
                 discrete_action_aid = (("global", discrete_action),)
                 self.action_set[discrete_action_aid] = discrete_action_list[("global", discrete_action)]
-                self.action_set_reversed[tuple(discrete_action_list[("global", discrete_action)])] = discrete_action_aid
+                #self.action_set_reversed[tuple(np.round(discrete_action_list[("global", discrete_action)]),6)] = discrete_action_aid
 
     def get_discrete_actions(self):
         return self.env.discrete_actions
 
-    def _brute_force_search(self, query_vec, candidate_vecs, knn):
+    def _brute_force_search(self, query_vec, action_set, knn):
         # compute distances between query_vec and each vector in candidate_vecs using the specified distance metric
-        if self.distance_computation == 'gpu':
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            if self.distance_metric == 'euclidean':
-                candidates = torch.tensor(candidate_vecs, device=device)
-                query = torch.tensor(query_vec, device=device)
-                dists = torch.cdist(query.unsqueeze(0), candidates)
-                vals, idx = torch.topk(dists, knn, largest=False)
-                return vals.cpu().numpy(), idx.cpu().numpy()
-            elif self.distance_metric == 'cosine':
-                candidates = torch.tensor(candidate_vecs, device=device, dtype=torch.float32)  # (N,d)
-                query = torch.tensor(query_vec, device=device, dtype=torch.float32).unsqueeze(0)  # (1,d)
-                candidates = torch.nn.functional.normalize(candidates, p=2, dim=1)  # (N,d)
-                query = torch.nn.functional.normalize(query, p=2, dim=1)  # (1,d)
-                sims = query @ candidates.T  # shape (1,N)
-                dists = 1.0 - sims
-                # top-k along last dimension
-                if knn >= len(candidate_vecs):
-                    knn = len(candidate_vecs)
-                vals, idx = torch.topk(dists, knn, largest=False, dim=1)  # shape (1,knn)
-                # convert to numpy
-                vals = vals.cpu().numpy()
-                idx = idx.cpu().numpy()
-                return vals, idx
-        else: # cpu python-based computation
-            dists = None
-            if self.distance_metric == 'euclidean':
-                dists = np.linalg.norm(candidate_vecs - query_vec, axis=1)
-            elif self.distance_metric  == 'manhattan':
-                dists = np.sum(np.abs(candidate_vecs - query_vec), axis=1)
-            elif self.distance_metric  == 'chebyshev':
-                dists = np.max(np.abs(candidate_vecs - query_vec), axis=1)
-            elif self.distance_metric  == 'cosine':
-                qn = np.linalg.norm(query_vec) + 1e-12
-                cn = np.linalg.norm(candidate_vecs, axis=1) + 1e-12
-                dists = 1.0 - (candidate_vecs @ query_vec) / (cn * qn)
 
+        if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+            #print("STD NODE EMBEDDINGS:", self.std_node_embeddings)
+            # ensure that for every canddiate vector we have a corresponding std vector in self.std_actions
+            if self.distance_metric == 'gaussian':
+                dists = gaussian_distance(query_vec, action_set, self.std_actions)
+            elif self.distance_metric == 'energy':
+                dists = energy_distance(query_vec, action_set, self.std_actions)
+            elif self.distance_metric == 'wasserstein':
+                dists = wasserstein_distance(query_vec, action_set, self.std_actions)
+            elif self.distance_metric == 'mahalanobis':
+                dists = mahalanobis_distance(query_vec, action_set, self.std_actions)
+            else:
+                raise ValueError(f"Unsupported distance metric for vgae projection: {self.distance_metric}")
             indices = np.argsort(dists)[:knn]
-            dists_sorted = dists[indices]
-            return dists_sorted.reshape(1, -1), indices.reshape(1, -1)
+            return dists[indices].reshape(1, -1), indices.reshape(1, -1)
+        else:
+            candidate_vecs = np.array(list(action_set.values()), dtype=np.float32)
+
+            if self.distance_computation == 'gpu':
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                candidates = torch.tensor(
+                    candidate_vecs,
+                    device=device,
+                    dtype=torch.float32
+                )
+
+                query = torch.tensor(
+                    query_vec,
+                    device=device,
+                    dtype=torch.float32
+                ).unsqueeze(0)  # (1, d)
+
+                if self.distance_metric == "euclidean":
+                    dists = torch.cdist(query, candidates)
+
+                elif self.distance_metric == "cosine":
+                    candidates = torch.nn.functional.normalize(candidates, p=2, dim=1)
+                    query = torch.nn.functional.normalize(query, p=2, dim=1)
+                    dists = 1 - query @ candidates.T
+
+                elif self.distance_metric == "manhattan":
+                    dists = torch.abs(candidates - query).sum(dim=1, keepdim=True).T
+
+                elif self.distance_metric == "chebyshev":
+                    dists = torch.abs(candidates - query).max(dim=1).values.unsqueeze(0)
+
+                else:
+                    raise ValueError(f"Unsupported GPU distance metric: {self.distance_metric}")
+
+                knn = min(knn, len(candidate_vecs))
+                vals, idx = torch.topk(dists, knn, largest=False, dim=1)
+
+                return vals.cpu().numpy(), idx.cpu().numpy()
+            else: # cpu python-based computation
+                dists = None
+                if self.distance_metric == 'euclidean':
+                    dists = np.linalg.norm(candidate_vecs - query_vec, axis=1)
+                elif self.distance_metric  == 'manhattan':
+                    dists = np.sum(np.abs(candidate_vecs - query_vec), axis=1)
+                elif self.distance_metric  == 'chebyshev':
+                    dists = np.max(np.abs(candidate_vecs - query_vec), axis=1)
+                elif self.distance_metric  == 'cosine':
+                    qn = np.linalg.norm(query_vec) + 1e-12
+                    cn = np.linalg.norm(candidate_vecs, axis=1) + 1e-12
+                    dists = 1.0 - (candidate_vecs @ query_vec) / (cn * qn)
+
+                indices = np.argsort(dists)[:knn]
+                dists_sorted = dists[indices]
+                return dists_sorted.reshape(1, -1), indices.reshape(1, -1)
 
     def set_knn(self, knn):
         self.knn = knn
@@ -342,7 +393,6 @@ class AgentTrainingWrapper(GraphWrapper):
                 )
         self.observation_space = spaces.Dict(self.observation_space_dict)
         self.observation_space_creation_time = time.time() - start_time
-
 
     def define_action_space(self, lower_bounds, upper_bounds, Gs, epsilon_lower=1, epsilon_upper=1):
         # Define the continuous action space based on the action types defined in the environment and the embedding sizes of the GNN models.
@@ -512,9 +562,8 @@ class AgentTrainingWrapper(GraphWrapper):
 
         if self.no_action_factor:
             all_distances = []
-            continuous_actions_array = np.array(list(self.action_set.values()), dtype=np.float32)
-            for vec in continuous_actions_array:
-                dists, _ = self._brute_force_search(vec, continuous_actions_array, knn=2)
+            for action in self.action_set:
+                dists, _ = self._brute_force_search(action, self.action_set, knn=2)
                 # Exclude self (first neighbor)
                 all_distances.append(dists[0, 1])
             all_distances = np.array(all_distances)
@@ -526,6 +575,20 @@ class AgentTrainingWrapper(GraphWrapper):
         # encode the graph using the specified GNN model and store the resulting node embeddings in self.node_embeddings
         start_time = time.time()
         # use the GNN model to encode the graph
+        if self.use_random_embeddings:
+            emb_dim = self.gnn_models[G_name].embedding_dim
+            if G_name not in self.random_node_embeddings:
+                self.random_node_embeddings[G_name] = {}
+            rng = np.random.default_rng(np.random.randint(2**31))
+            for node in G.nodes():
+                if node not in self.random_node_embeddings[G_name]:
+                # deterministic seed per graph/node
+                    self.random_node_embeddings[G_name][node] = rng.standard_normal(
+                        emb_dim
+                    ).astype(np.float32)
+            self.node_embeddings[G_name] = self.random_node_embeddings[G_name]
+            return
+
         gnn_model = self.gnn_models[G_name]
         data = from_networkx(G)
         with torch.no_grad():
@@ -537,7 +600,18 @@ class AgentTrainingWrapper(GraphWrapper):
                     _, node_emb, _ = gnn_model(data.x, data.edge_index, data.edge_attr)
                 elif self.vgae_projection == 'sample':
                     node_emb, _, _ = gnn_model(data.x, data.edge_index, data.edge_attr)
+                elif self.vgae_projection == 'distribution':
+                    _, mean, std = gnn_model(data.x, data.edge_index, data.edge_attr)
 
+                    node_emb = mean
+
+                    if G_name not in self.std_node_embeddings:
+                        self.std_node_embeddings[G_name] = {}
+
+                    for i, node in enumerate(G.nodes()):
+                        self.std_node_embeddings[G_name][node] = (
+                            std[i].detach().cpu().numpy()
+                        )
         new_embeddings = {n: node_emb[i].numpy() for i, n in enumerate(G.nodes())}
         self.node_embeddings[G_name] = new_embeddings
         self.graph_encoding_time += time.time() - start_time
@@ -559,6 +633,7 @@ class AgentTrainingWrapper(GraphWrapper):
             ]
 
         if self.action_candidates_reconstruction or len(self.action_candidates) == 0:
+            #print("RECONSTRUCTING ACTIONS")
             self.action_candidates = {}
             for key in self.env._action_type:
                 action_type = self.env._action_type[key]
@@ -851,6 +926,10 @@ class AgentTrainingWrapper(GraphWrapper):
                                     filtered_combination[elem] = filtered_combination[elem][1:]
                         if self.env.is_valid_action(*filtered_combination.values()):
                             filtered_actions[key_name] = combination
+                        else:
+                            # need to drop eventual invalid action added before
+                            if key_name in filtered_actions:
+                                filtered_actions.pop(key_name)
                     else:
                         filtered_actions[key_name] = combination
             self.action_candidates = filtered_actions
@@ -874,23 +953,6 @@ class AgentTrainingWrapper(GraphWrapper):
         if self.local_num_iterations == 1:
             cmp_at_k = compute_space_cmp_stats(continuous_actions)
             cmp_at_k_collection.append(cmp_at_k)
-
-        if self.plot_action_space and (num_iterations != 0 and (num_iterations % self.plot_action_space_interval == 0)):
-            # periodically plot the action space using UMAP, coloring points by their discrete action type and optionally showing cmp@k statistics in the title or as annotations. If cmp@k statistics are available for multiple iterations, consider plotting the evolution of these statistics over iterations in a separate plot or as part of the same visualization.
-            if cmp_at_k_collection:
-                # average should be computed knowing that inside each there wil be a dict indexed with k
-                cmp_at_k_dict = {}
-                for cmp_at_k in cmp_at_k_collection:
-                    for k, v in cmp_at_k.items():
-                        if k not in cmp_at_k_dict:
-                            cmp_at_k_dict[k] = []
-                        cmp_at_k_dict[k].append(v)
-                avg_cmp_at_k = {}
-                for k in cmp_at_k_dict:
-                    avg_cmp_at_k[k] = np.mean(cmp_at_k_dict[k])
-                plot_umap_actions(continuous_actions, cmp_at_k=avg_cmp_at_k, logs_folder=os.path.join(self.logs_folder, "plots"),
-                                    discrete_actions=self.env.discrete_actions, environment_name=self.env_name,
-                                    num_iterations=num_iterations)
 
         if self.sample_subset_actions and self.sample_subset_actions > 0 and len(continuous_actions) > self.sample_subset_actions:
             # Sample a subset of actions if specified
@@ -947,9 +1009,11 @@ class AgentTrainingWrapper(GraphWrapper):
             return False
 
         continuous_actions = {}
+        continuous_stds = {}
         # ignored if self.use_feature_vector is True
         for action_id, action in actions.items():
             continuous_action = {}
+            continuous_std = {}
             count_actions += 1
             for key, action_type in action_types.items():
                 count_parts += 1
@@ -973,6 +1037,14 @@ class AgentTrainingWrapper(GraphWrapper):
 
                     if not self.use_feature_vectors:
                         continuous_action[key] = self.node_embeddings[graph_name][action_value]
+                        if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                            try:
+                                continuous_std[key] = self.std_node_embeddings[graph_name][action_value]
+                            except KeyError as e:
+                                print("Keys inside std_node_embeddings:", list(self.std_node_embeddings.keys()))
+                                print("Used node embeddings for graph", graph_name, ":", tuple(np.round(self.node_embeddings[graph_name][action_value], 5)))
+                                print(e)
+                                print(self.std_node_embeddings[graph_name][action_value])
                         if action_type.concat_features is not None:
                             concat_encoding = []
                             for feature in action_type.concat_features:
@@ -1001,16 +1073,77 @@ class AgentTrainingWrapper(GraphWrapper):
                                 concat_encoding.extend(encoding)
                             continuous_action[key] = np.concatenate(
                                 [continuous_action[key], np.array(concat_encoding, dtype=np.float32)])
+                            continuous_std[key] = np.concatenate(
+                                [continuous_std[key], np.array([1e-4] * len(concat_encoding), dtype=np.float32)])
                     else:
                         continuous_action[key] = Gs[graph_name].nodes[action_value]['x']
                 elif isinstance(action_type, Edge):
-
                     graph_name = action[key][0]
-                    source_emb = self.node_embeddings[graph_name][action[key][1]]
-                    target_emb = self.node_embeddings[graph_name][action[key][2]]
+
+                    # 1. Choose the base node representation
+                    if self.use_feature_vectors:
+                        source_emb = Gs[graph_name].nodes[action[key][1]]['x']
+                        target_emb = Gs[graph_name].nodes[action[key][2]]['x']
+                    else:
+                        source_emb = self.node_embeddings[graph_name][action[key][1]]
+                        target_emb = self.node_embeddings[graph_name][action[key][2]]
+
+                    # 2. Pool the two node representations
                     continuous_action[key] = []
                     for pooling in action_type.poolings:
                         continuous_action[key].extend(pooling([source_emb, target_emb]))
+
+                    if not self.use_feature_vectors and self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                        continuous_std[key] = []
+                        stds = [
+                            self.std_node_embeddings[graph_name][action[key][1]],
+                            self.std_node_embeddings[graph_name][action[key][2]],
+                        ]
+
+                        variances = [s ** 2 for s in stds]
+
+                        for pooling in action_type.poolings:
+
+                            if pooling == ConcatPooling:
+                                pooled_std = np.concatenate(stds, axis=0)
+
+                            elif pooling == SumPooling:
+                                pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0))
+
+                            elif pooling == MeanPooling:
+                                n = len(stds)
+                                pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0)) / n
+
+                            elif pooling == MaxPooling:
+                                # Approximation: keep the uncertainty of the selected maximum.
+                                means = [
+                                    self.node_embeddings[graph_name][action[key][1]],
+                                    self.node_embeddings[graph_name][action[key][2]],
+                                ]
+                                idx = np.argmax(np.stack(means), axis=0)
+                                pooled_std = np.take_along_axis(
+                                    np.stack(stds),
+                                    idx[None, :],
+                                    axis=0
+                                )[0]
+
+                            elif pooling == MinPooling:
+                                means = [
+                                    self.node_embeddings[graph_name][action[key][1]],
+                                    self.node_embeddings[graph_name][action[key][2]],
+                                ]
+                                idx = np.argmin(np.stack(means), axis=0)
+                                pooled_std = np.take_along_axis(
+                                    np.stack(stds),
+                                    idx[None, :],
+                                    axis=0
+                                )[0]
+
+                            else:
+                                raise ValueError(f"Unsupported pooling {pooling}")
+
+                            continuous_std[key].extend(pooled_std)
+
                     if action_type.concat_node_features is not None:
                         encodings = []
                         for feature in action_type.concat_node_features:
@@ -1047,6 +1180,60 @@ class AgentTrainingWrapper(GraphWrapper):
                                 encoding.extend(pooling(encodings))
                             continuous_action[key] = np.concatenate(
                                 [continuous_action[key], np.array(encoding, dtype=np.float32)])
+                            continuous_std[key] = np.concatenate(
+                                [continuous_std[key], np.array([1e-4] * len(encoding), dtype=np.float32)])
+                    # In feature-vector mode, ALWAYS append edge features when present.
+                    # This is independent of concat_edge_features.
+                    if self.use_feature_vectors:
+
+                        edge_tuple = (action[key][1], action[key][2])
+                        edge_data = Gs[graph_name].get_edge_data(
+                            edge_tuple[0],
+                            edge_tuple[1],
+                            default={}
+                        )
+
+                        edge_attr_dict = edge_data.get("edge_attr_dict", {})
+
+                        for feature, attribute_value in edge_attr_dict.items():
+
+                            # Only attributes that are registered edge attributes
+                            if feature not in self.env._edge_attributes:
+                                continue
+
+                            attribute = self.env._edge_attributes[feature]
+
+                            if attribute.feature_extractor:
+                                if isinstance(attribute_value, list):
+
+                                    elements_encodings = [
+                                        attribute.feature_extractor(
+                                            el,
+                                            **attribute.feature_extractor_args
+                                        )
+                                        for el in attribute_value
+                                    ]
+
+                                    if not elements_encodings:
+                                        continue
+
+                                    encoding = []
+                                    for pooling in attribute.poolings:
+                                        encoding.extend(pooling(elements_encodings))
+
+                                else:
+                                    encoding = attribute.feature_extractor(
+                                        attribute_value,
+                                        **attribute.feature_extractor_args
+                                    )
+                            else:
+                                encoding = attribute_value
+
+                            continuous_action[key] = np.concatenate([
+                                continuous_action[key],
+                                np.asarray(encoding, dtype=np.float32)
+                            ])
+
                     if not self.use_feature_vectors:
                         if action_type.concat_edge_features is not None:
                             for feature in action_type.concat_edge_features:
@@ -1080,6 +1267,56 @@ class AgentTrainingWrapper(GraphWrapper):
                     continuous_action[key] = []
                     for pooling in action_type.poolings:
                         continuous_action[key].extend(pooling([source_emb, target_emb]))
+                    if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                        continuous_std[key] = []
+                        stds = [
+                            self.std_node_embeddings[graph_name][action[key][1]],
+                            self.std_node_embeddings[graph_name][action[key][2]],
+                        ]
+
+                        variances = [s ** 2 for s in stds]
+
+                        for pooling in action_type.poolings:
+
+                            if pooling == ConcatPooling:
+                                pooled_std = np.concatenate(stds, axis=0)
+
+                            elif pooling == SumPooling:
+                                pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0))
+
+                            elif pooling == MeanPooling:
+                                n = len(stds)
+                                pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0)) / n
+
+                            elif pooling == MaxPooling:
+                                # Approximation: keep the uncertainty of the selected maximum.
+                                means = [
+                                    self.node_embeddings[graph_name][action[key][1]],
+                                    self.node_embeddings[graph_name][action[key][2]],
+                                ]
+                                idx = np.argmax(np.stack(means), axis=0)
+                                pooled_std = np.take_along_axis(
+                                    np.stack(stds),
+                                    idx[None, :],
+                                    axis=0
+                                )[0]
+
+                            elif pooling == MinPooling:
+                                means = [
+                                    self.node_embeddings[graph_name][action[key][1]],
+                                    self.node_embeddings[graph_name][action[key][2]],
+                                ]
+                                idx = np.argmin(np.stack(means), axis=0)
+                                pooled_std = np.take_along_axis(
+                                    np.stack(stds),
+                                    idx[None, :],
+                                    axis=0
+                                )[0]
+
+                            else:
+                                raise ValueError(f"Unsupported pooling {pooling}")
+
+                            continuous_std[key].extend(pooled_std)
                 elif isinstance(action_type, SubGraph):
                     graph_name = action[key][0]
                     if not self.use_feature_vectors:
@@ -1089,6 +1326,51 @@ class AgentTrainingWrapper(GraphWrapper):
                     continuous_action[key] = []
                     for pooling in action_type.poolings:
                         continuous_action[key].extend(pooling(subgraph_embs))
+                    if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                        continuous_std[key] = []
+                        stds = [
+                            self.std_node_embeddings[graph_name][n]
+                            for n in action[key][1:]
+                        ]
+
+                        variances = [s ** 2 for s in stds]
+
+                        for pooling in action_type.poolings:
+
+                            if pooling == ConcatPooling:
+                                pooled_std = np.concatenate(stds, axis=0)
+
+                            elif pooling == SumPooling:
+                                pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0))
+
+                            elif pooling == MeanPooling:
+                                n = len(stds)
+                                pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0)) / n
+
+                            elif pooling == MaxPooling:
+                                # Approximation: keep the uncertainty of the selected maximum.
+                                means = subgraph_embs
+                                idx = np.argmax(np.stack(means), axis=0)
+                                pooled_std = np.take_along_axis(
+                                    np.stack(stds),
+                                    idx[None, :],
+                                    axis=0
+                                )[0]
+
+                            elif pooling == MinPooling:
+                                means = subgraph_embs
+                                idx = np.argmin(np.stack(means), axis=0)
+                                pooled_std = np.take_along_axis(
+                                    np.stack(stds),
+                                    idx[None, :],
+                                    axis=0
+                                )[0]
+
+                            else:
+                                raise ValueError(f"Unsupported pooling {pooling}")
+
+                            continuous_std[key].extend(pooled_std)
+
                 elif isinstance(action_type, Path):
                     graph_name = action[key][0]
                     # cases transpose graph and normal graph
@@ -1110,6 +1392,50 @@ class AgentTrainingWrapper(GraphWrapper):
                         path_node_embs = [Gs[graph_name].nodes[n]['x'] for n in action[key][1]]
                     for pooling in action_type.poolings:
                         continuous_action[key].extend(pooling(path_node_embs))
+                        if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                            continuous_std[key] = []
+                            stds = [
+                                self.std_node_embeddings[graph_name][n]
+                                for n in action[key][1:]
+                            ]
+
+                            variances = [s ** 2 for s in stds]
+
+                            for pooling in action_type.poolings:
+
+                                if pooling == ConcatPooling:
+                                    pooled_std = np.concatenate(stds, axis=0)
+
+                                elif pooling == SumPooling:
+                                    pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0))
+
+                                elif pooling == MeanPooling:
+                                    n = len(stds)
+                                    pooled_std = np.sqrt(np.sum(np.stack(variances), axis=0)) / n
+
+                                elif pooling == MaxPooling:
+                                    # Approximation: keep the uncertainty of the selected maximum.
+                                    means = path_node_embs
+                                    idx = np.argmax(np.stack(means), axis=0)
+                                    pooled_std = np.take_along_axis(
+                                        np.stack(stds),
+                                        idx[None, :],
+                                        axis=0
+                                    )[0]
+
+                                elif pooling == MinPooling:
+                                    means = path_node_embs
+                                    idx = np.argmin(np.stack(means), axis=0)
+                                    pooled_std = np.take_along_axis(
+                                        np.stack(stds),
+                                        idx[None, :],
+                                        axis=0
+                                    )[0]
+
+                                else:
+                                    raise ValueError(f"Unsupported pooling {pooling}")
+
+                                continuous_std[key].extend(pooled_std)
                         if pooling == ConcatPooling:
                             # pad to max lenpath_node_embs
                             max_len = action_type.max_len
@@ -1117,9 +1443,71 @@ class AgentTrainingWrapper(GraphWrapper):
                             if current_len <= max_len + 1:
                                 pad_size = (max_len + 1 - current_len) * len(path_node_embs[0])
                                 continuous_action[key].extend([0] * pad_size)
+                                if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                                    continuous_std[key].extend([0] * pad_size)
                             elif current_len > max_len + 1:
                                 # remove key
                                 continuous_actions.pop(key, None)
+                                if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                                    continuous_stds.pop(key, None)
+                    if self.use_feature_vectors:
+
+                        path = action[key][1]
+
+                        # Every consecutive pair of nodes defines an edge in the path.
+                        for u, v in zip(path[:-1], path[1:]):
+
+                            edge_data = Gs[graph_name].get_edge_data(u, v)
+
+                            if edge_data is None:
+                                edge_data = Gs[graph_name].get_edge_data(v, u)
+
+                            if edge_data is None:
+                                continue
+
+                            edge_attr_dict = edge_data.get("edge_attr_dict", {})
+
+                            # ALWAYS concatenate present edge features.
+                            for feature, attribute_value in edge_attr_dict.items():
+
+                                if feature not in self.env._edge_attributes:
+                                    continue
+
+                                attribute = self.env._edge_attributes[feature]
+
+                                if attribute.feature_extractor:
+
+                                    if isinstance(attribute_value, list):
+
+                                        elements_encodings = [
+                                            attribute.feature_extractor(
+                                                el,
+                                                **attribute.feature_extractor_args
+                                            )
+                                            for el in attribute_value
+                                        ]
+
+                                        if not elements_encodings:
+                                            continue
+
+                                        encoding = []
+                                        for pooling in attribute.poolings:
+                                            encoding.extend(pooling(elements_encodings))
+
+                                    else:
+                                        encoding = attribute.feature_extractor(
+                                            attribute_value,
+                                            **attribute.feature_extractor_args
+                                        )
+
+                                else:
+                                    encoding = attribute_value
+
+                                continuous_action[key] = np.concatenate([
+                                    continuous_action[key],
+                                    np.asarray(encoding, dtype=np.float32)
+                                ])
+
                     if not self.use_feature_vectors:
                         if action_type.concat_node_features is not None:
                             encodings = []
@@ -1177,6 +1565,8 @@ class AgentTrainingWrapper(GraphWrapper):
                         else:
                             # call the feature extractor if available
                             continuous_action[key] = action_type.feature_extractor(action[key][1:], **action_type.feature_extractor_args)
+                            if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                                continuous_std[key] = [1e-4 for _ in range(len(continuous_action[key]))]
                             self._action_lookup_cache[action_key_hashable] = continuous_action[key]
                             self._new_action_entries_since_save += 1
                             if self._new_action_entries_since_save >= self.cache_save_interval:
@@ -1202,42 +1592,60 @@ class AgentTrainingWrapper(GraphWrapper):
                         continuous_vector.extend(elem)
                 else:
                     continuous_vector.extend(continuous_action[key])
-            continuous_actions[action_id] = np.array(continuous_vector, dtype=np.float32)
+            continuous_std_vector = []
 
+            if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                for key in action_types:
+                    if isinstance(continuous_std[key], np.ndarray):
+                        elem = continuous_std[key].tolist()
+                        # check if dimensionality is 2 unpack
+                        if isinstance(elem[0], list):
+                            for subelem in elem:
+                                continuous_std_vector.extend(subelem)
+                        else:
+                            continuous_std_vector.extend(elem)
+                    else:
+                        continuous_std_vector.extend(continuous_std[key])
+            continuous_actions[action_id] = np.array(continuous_vector, dtype=np.float32)
+            if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+                continuous_stds[action_id] = continuous_std_vector
 
         all_actions = list(continuous_actions.values())
-
         all_actions_np = np.array(all_actions, dtype=np.float32)
 
         lower_bounds = np.min(all_actions_np, axis=0)
         upper_bounds = np.max(all_actions_np, axis=0)
 
-        if self.norm_action_space == "min-max":
-            range_bounds = upper_bounds - lower_bounds
-            range_bounds[range_bounds == 0] = 1e-8  # prevent divide-by-zero
+        if not self.vgae_projection == "distribution":
+            if self.norm_action_space == "min-max":
+                range_bounds = upper_bounds - lower_bounds
+                range_bounds[range_bounds == 0] = 1e-8  # prevent divide-by-zero
 
-            for aid in continuous_actions:
-                continuous_actions[aid] = (continuous_actions[aid] - lower_bounds) / range_bounds
+                for aid in continuous_actions:
+                    continuous_actions[aid] = (continuous_actions[aid] - lower_bounds) / range_bounds
 
-            # new action lower and upper bounds
-            lower_bounds = np.array([0] * len(lower_bounds), dtype=np.float32)
-            upper_bounds = np.array([1] * len(upper_bounds), dtype=np.float32)
+                # new action lower and upper bounds
+                lower_bounds = np.array([0] * len(lower_bounds), dtype=np.float32)
+                upper_bounds = np.array([1] * len(upper_bounds), dtype=np.float32)
 
-        elif self.norm_action_space == "z-score":
-            mean = np.mean(all_actions_np, axis=0)
-            std = np.std(all_actions_np, axis=0)
-            std[std == 0] = 1e-8  # prevent divide-by-zero
+            elif self.norm_action_space == "z-score":
+                mean = np.mean(all_actions_np, axis=0)
+                std = np.std(all_actions_np, axis=0)
+                std[std == 0] = 1e-8  # prevent divide-by-zero
 
-            for aid in continuous_actions:
-                continuous_actions[aid] = (continuous_actions[aid] - mean) / std
+                for aid in continuous_actions:
+                    continuous_actions[aid] = (continuous_actions[aid] - mean) / std
 
-            # compute new action lower and upper bounds as arrays
-            lower_bounds = -3 * np.ones_like(mean)
-            upper_bounds = 3 * np.ones_like(mean)
+                # compute new action lower and upper bounds as arrays
+                lower_bounds = -3 * np.ones_like(mean)
+                upper_bounds = 3 * np.ones_like(mean)
 
         if not self.norm_action_space:
-            lower_bounds = [-100] * all_actions_np.shape[1]
-            upper_bounds = [+100] * all_actions_np.shape[1]
+            lower_bounds = np.array([-100] * all_actions_np.shape[1], dtype=np.float32)
+            upper_bounds = np.array([100] * all_actions_np.shape[1], dtype=np.float32)
+        if self.vgae_projection == 'distribution' and self.gae_model_type == 'vgae':
+            for key in continuous_stds:
+                self.std_actions[key] = continuous_stds[key]
 
         return continuous_actions, lower_bounds, upper_bounds
 
@@ -1273,11 +1681,13 @@ class AgentTrainingWrapper(GraphWrapper):
         self.observation = self.get_observation(encoded_Gs)
         if self.algorithm_type == "projection" or self.algorithm_type == "iterative":
             self.action_set, new_action_lower_bounds, new_action_upper_bounds = self.create_continuous_action_space(encoded_Gs, changed_nodes_Gs)
-            self.action_set_reversed = {tuple(v): k for k, v in self.action_set.items()}
+            #self.action_set_reversed = {tuple(np.round(v, 6)): k for k, v in self.action_set.items()}
             self.perform_pca_reduction()
-            if self.distance_computation == 'faiss' and self.algorithm_type != "iterative":
+            if (self.algorithm_type == "projection" or self.projection_agent) and self.distance_computation == 'faiss':
                 self.rebuild_index()
         self.cmp_at_k_saving()
+        if self.projection_agent:
+            self.restrict_action_space()
         return self.observation, info
 
     def cmp_at_k_saving(self):
@@ -1316,18 +1726,18 @@ class AgentTrainingWrapper(GraphWrapper):
         action_vectors = np.ascontiguousarray(action_vectors)
         dim = action_vectors.shape[1]
         metric_name = getattr(self, "distance_metric", "euclidean")
+        if metric_name in {"manhattan", "chebyshev", "gaussian"}:
+            self.index = None
+            return
 
         if metric_name == "euclidean":
             metric = faiss.METRIC_L2
-
         elif metric_name == "cosine":
-            # cosine similarity = inner product on normalized vectors
+            action_vectors = action_vectors.copy()
             faiss.normalize_L2(action_vectors)
             metric = faiss.METRIC_INNER_PRODUCT
-
         elif metric_name == "ip":
             metric = faiss.METRIC_INNER_PRODUCT
-
         else:
             raise ValueError(f"Unsupported distance metric: {metric_name}")
 
@@ -1427,7 +1837,8 @@ class AgentTrainingWrapper(GraphWrapper):
                     f"Action vector dimensionality {len(action_vector)} does not match action space upper bounds dimensionality {len(self.action_upper_bounds)}."
                 # assert with small tolerance
                 if self.algorithm_type == "iterative":
-                    selected_action = self.action_set_reversed.get(tuple(action_vector), None)
+                    key = tuple(np.round(action_vector, 6))
+                    selected_action = self.action_set_reversed.get(key)
                     real_action = ()
                     for component in selected_action:
                         values = component[1:]
@@ -1466,14 +1877,15 @@ class AgentTrainingWrapper(GraphWrapper):
         else:
             graph_changed = 0
 
-        if graph_changed and self.action_space_reconstruction_each_step and (self.algorithm_type == "projection" or self.algorithm_type == "iterative"):
+        if (graph_changed or self.action_space_reconstruction_each_step) and (self.algorithm_type == "projection" or self.algorithm_type == "iterative"):
             self.action_set, _, _ = self.create_continuous_action_space(encoded_Gs, changed_nodes_Gs)
-            self.action_set_reversed = {tuple(v): k for k, v in self.action_set.items()}
             self.perform_pca_reduction()
-            if len(self.action_set) > 0 and self.distance_computation == 'faiss' and self.algorithm_type != "iterative":
+            if len(self.action_set) > 0 and (self.algorithm_type == "projection" or self.projection_agent) and self.distance_computation == 'faiss':
                 self.rebuild_index()
         if done or truncated:
             self.update_metrics()
+        if self.projection_agent:
+            self.restrict_action_space()
         return self.observation, reward, done, truncated, info
 
     def update_metrics(self):
@@ -1485,48 +1897,57 @@ class AgentTrainingWrapper(GraphWrapper):
         # You can use FAISS for efficiency or using a brute-force approach for exact results, based on the distance_computation setting.
         start_time = time.time()
         action_ids = list(self.action_set.keys())
-        action_vectors = np.array([self.action_set[aid] for aid in action_ids]).astype('float32')
+        action_vectors = np.array(
+                 [self.action_set[aid] for aid in action_ids],
+                 dtype=np.float32
+        )
         action_vector = action_vector.astype('float32')
         if self.gae_model_type == 'gae' or (self.gae_model_type == 'vgae' and (self.vgae_projection == 'mean' or self.vgae_projection == 'sample')):
             if self.distance_computation == 'faiss':
                 distances, indices = self._search_faiss(action_vector, self.knn)
             else:
-                distances, indices = self._brute_force_search(action_vector, action_vectors, self.knn)
+                distances, indices = self._brute_force_search(action_vector, self.action_set, self.knn)
         else:
-            if self.distance_computation == 'faiss':
+            if self.distance_computation == 'faiss' and (self.gae_model_type == 'vgae' and self.vgae_projection != 'distribution'):
                 distances, indices = self._search_faiss(action_vector, self.knn)
             else:
-                distances, indices = self._brute_force_search(action_vector, action_vectors, self.knn)
+                distances, indices = self._brute_force_search(action_vector, self.action_set, self.knn)
 
         # compare distance first neighbor with tau
         if self.no_action_factor:
             if distances[0][0] > self.no_action_factor*self.tau:
                 return ("no_action",), None
+        if len(action_vectors) == 0:
+            self.last_knn_candidates = np.array([])  # shape: [0, proto_dim]
+            return None, None
+        else:
+            self.last_knn_candidates = action_vectors[indices[0]]  # shape: [K, proto_dim]
 
-        self.last_knn_candidates = action_vectors[indices[0]]  # shape: [K, proto_dim]
 
-        selected_index = self._select_best_index(distances, indices[0], action_ids,
-                                                 get_function_from_protoknnconfig(self.protoknn_heuristic))
+            selected_index = self._select_best_index(distances, indices[0], action_ids,
+                                                     get_function_from_protoknnconfig(self.protoknn_heuristic))
 
-        self.last_selected_knn_index = np.where(indices[0] == selected_index)[0][0]
+            self.last_selected_knn_index = np.where(indices[0] == selected_index)[0][0]
 
-        self.action_mapping_time += time.time() - start_time
+            self.action_mapping_time += time.time() - start_time
 
-        selected_action = ()
-        for component in action_ids[selected_index]:
-            values = component[1:]
-            if len(values) == 1:
-                # Single element — append it directly as (value,)
-                selected_action += (values[0],)
-            else:
-                # Multiple elements — append the tuple
-                selected_action += (values,)
+            selected_action = ()
+            for component in action_ids[selected_index]:
+                values = component[1:]
+                if len(values) == 1:
+                    # Single element — append it directly as (value,)
+                    selected_action += (values[0],)
+                else:
+                    # Multiple elements — append the tuple
+                    selected_action += (values,)
 
-        return selected_action, action_vectors[indices[0]]
+            return selected_action, action_vectors[indices[0]]
 
     def store_KNNs(self, candidate_action, no_normalization=False):
         # compute KNN candidates for the given candidate action vector and store them for retrieval
         _, action_vectors = self.map_action(candidate_action)
+        if not isinstance(action_vectors, np.ndarray):
+            return
         if not no_normalization:
             action_vectors = np.array([self.convert_norm_action_to_original_space(vec) for vec in action_vectors])
         self.candidate_action_KNNs = action_vectors
@@ -1572,14 +1993,27 @@ class AgentTrainingWrapper(GraphWrapper):
             # return all action vectors in the action set
             return np.array(list(self.action_set.values())).astype('float32')
 
+    def restrict_action_space(self):
+        candidate_action = self.projection_agent.predict(self.observation, deterministic=False)
+        self.store_KNNs(candidate_action[0], no_normalization=True)
+
     def _search_faiss(self, query_vec, knn):
         # Search the FAISS index for the K nearest neighbors of the query vector, and return their distances and indices.
         # The search can be done using different distance metrics specified in distance_metric, such as euclidean, cosine, or inner product.
+        metric = getattr(self, "distance_metric", "euclidean")
+
+        if metric in {"manhattan", "chebyshev"} or self.index is None:
+            distances, indices = self._brute_force_search(
+                query_vec,
+                self.action_set,
+                knn
+            )
+            return distances, indices
+
         query_vec = np.asarray(query_vec, dtype=np.float32)
         query_vec = np.expand_dims(query_vec, axis=0)
         query_vec = np.ascontiguousarray(query_vec)
 
-        metric = getattr(self, "distance_metric", "euclidean")
 
         if metric == "cosine":
             faiss.normalize_L2(query_vec)

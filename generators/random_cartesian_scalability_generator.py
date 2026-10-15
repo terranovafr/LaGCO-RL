@@ -4,11 +4,12 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
+
 """
     random_cartesian_scalability_generator.py
     Script to generate environments for scalability evaluation with Cartesian splits. For each size in the specified range, it generates a fixed number of environments, computes their complexity, and then creates train-test splits based on size. The generated environments and splits are saved in a structured directory for easy access during training and evaluation.
 """
-
 import copy
 import os
 import random
@@ -92,6 +93,9 @@ def generate_cartesian_scenarios(
     # -------------------------------------------------
     # 1️⃣ Generate ALL environments first
     # -------------------------------------------------
+    general_config = load_yaml(os.path.join(script_dir, "..", "config.yaml"))
+    keys_config = {k: v for k, v in general_config.items() if isinstance(v, dict) and 'key' in v}
+
     for size in sizes:
         print(f"[INFO] Generating environments for size {size}")
 
@@ -113,6 +117,9 @@ def generate_cartesian_scenarios(
                     v2 = size - v1
                     base_cfg[p1] = v1
                     base_cfg[p2] = v2
+
+                for key in keys_config:
+                    base_cfg[key] = keys_config[key]  # add to environment configuration the values of the general configuration that are relevant for the environment (e.g. with same key)
 
                 attempts += 1
                 try:
@@ -295,5 +302,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

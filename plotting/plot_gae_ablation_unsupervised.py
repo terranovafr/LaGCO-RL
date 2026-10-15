@@ -4,10 +4,10 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
-"""
-    plot_gae_ablation.py
-    Script to plot GAE ablation results from YAML logs
-"""
+'''
+    plot_gae_ablation_unsupervised.py
+    This script plots the results of the GAE ablation study, comparing the performance of different loss term configurations across various environments. It generates visualizations to illustrate the impact of each loss term on the unsupervised GAE model's performance.
+'''
 
 import argparse
 import yaml
@@ -26,44 +26,20 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 
 weight_to_lossname = {
     "adj_weight": "adj_loss",
-    "node_feature_vector_weight": "node_feature_vector_loss",
-    "edge_feature_vector_weight": "edge_feature_vector_loss",
-    "diversity_weight": "diversity_loss",
-    "node_feature_vector_binary_cat_weight": "node_feature_vector_binary_cat_loss",
-    "node_feature_vector_multi_cat_weight": "node_feature_vector_multi_cat_loss",
-    "node_feature_vector_cont_weight": "node_feature_vector_cont_loss",
-    "node_feature_vector_ranking_weight": "node_feature_vector_ranking_loss",
-    "edge_feature_vector_binary_cat_weight": "edge_feature_vector_binary_cat_loss",
-    "edge_feature_vector_multi_cat_weight": "edge_feature_vector_multi_cat_loss",
-    "edge_feature_vector_cont_weight": "edge_feature_vector_cont_loss",
-    "edge_feature_vector_ranking_weight": "edge_feature_vector_ranking_loss",
-    "kl_weight": "kl_loss",
+    "node_features": "node_features_loss",
+    "edge_features": "edge_features_loss",
 }
 
 pretty_loss_names = {
-    "adj_loss": "Adjacency Loss",
-    "node_feature_vector_binary_cat_loss": "Node Binary Features Loss",
-    "node_feature_vector_multi_cat_loss": "Node Categorical Features Loss",
-    "node_feature_vector_cont_loss": "Node Continuous Features Loss",
-    "node_feature_vector_ranking_loss": "Node Ranking Loss",
-    "edge_feature_vector_binary_cat_loss": "Edge Binary Features Loss",
-    "edge_feature_vector_multi_cat_loss": "Edge Categorical Features Loss",
-    "edge_feature_vector_cont_loss": "Edge Continuous Features Loss",
-    "edge_feature_vector_ranking_loss": "Edge Ranking Loss",
-    "kl_loss": "KL Loss",
+    "adj_loss": "Adjacency",
+    "node_features_loss": "Node Features",
+    "edge_features_loss": "Edge Features",
 }
 
 pretty_weight_names = {
-    "adj_weight": "Adjacency Loss",
-    "node_feature_vector_binary_cat_weight": "Node Binary Features Loss",
-    "node_feature_vector_multi_cat_weight": "Node Categorical Features Loss",
-    "node_feature_vector_cont_weight": "Node Continuous Features Loss",
-    "node_feature_vector_ranking_weight": "Node Ranking Loss",
-    "edge_feature_vector_binary_cat_weight": "Edge Binary Features Loss",
-    "edge_feature_vector_multi_cat_weight": "Edge Categorical Features Loss",
-    "edge_feature_vector_cont_weight": "Edge Continuous Features Loss",
-    "edge_feature_vector_ranking_weight": "Edge Ranking Loss",
-    "kl_weight": "KL Loss",
+    "adj_weight": "Adjacency",
+    "node_features": "Node Features",
+    "edge_features": "Edge Features",
 }
 
 def build_delta_matrix(df):
@@ -75,12 +51,10 @@ def build_delta_matrix(df):
     if "baseline" not in pivot.index:
         raise ValueError("Baseline (_ablation_None) not found!")
 
-    baseline = pivot.loc["baseline"]
-
     # -------------------------------
     # 2. Compute delta
     # -------------------------------
-    delta = pivot #.subtract(baseline, axis=1)
+    delta = pivot
 
     # -------------------------------
     # 3. Rename columns + rows
@@ -95,25 +69,8 @@ def build_delta_matrix(df):
             new_index.append(pretty_weight_names.get(w, w))
     delta.index = new_index
 
-    # -------------------------------
-    # 4. Mask diagonal ONLY for ablations
-    # -------------------------------
-    for weight in df["ablated_weight"].unique():
-        if weight == "baseline":
-            continue  # 🚨 do NOT mask baseline
-
-        raw_loss = weight_to_lossname.get(weight)
-        if raw_loss is None:
-            continue
-
-        pretty_row = pretty_weight_names.get(weight)
-        pretty_col = pretty_loss_names.get(raw_loss)
-
-        if pretty_row in delta.index and pretty_col in delta.columns:
-            delta.loc[pretty_row, pretty_col] = np.nan
-
-    # -------------------------------
-    # 5. Remove invalid rows (except baseline)
+    # --------------------------
+    # 4. Remove invalid rows (except baseline)
     # -------------------------------
     rows_to_keep = []
 
@@ -147,19 +104,15 @@ def to_latex_neurips(df, caption="", label=""):
     # Column name formatting (compact headers)
     # -------------------------------
     header_map = {
-        "Adjacency Loss": r"\thead{Adjacency\\Loss}",
-        "Edge Continuous Features Loss": r"\thead{Edge\\Continuous}",
-        "Node Binary Features Loss": r"\thead{Node\\Binary}",
-        "Node Continuous Features Loss": r"\thead{Node\\Continuous}",
-        "Node Categorical Features Loss": r"\thead{Node\\Categorical}",
+        "Adjacency": r"\thead{Adj}",
+        "Node Features": r"\thead{Node}",
+        "Edge Features": r"\thead{Edge}",
     }
 
     row_map = {
-        "Adjacency Loss": "Adjacency Loss",
-        "Edge Continuous Features Loss": "Edge Continuous Features",
-        "Node Binary Features Loss": "Node Binary Features",
-        "Node Continuous Features Loss": "Node Continuous Features",
-        "Node Categorical Features Loss": "Node Categorical Features",
+        "Adjacency": "Adj",
+        "Node Features": "Node",
+        "Edge Features": "Edge",
     }
 
     # Apply mapping (fallback = raw name)
@@ -239,7 +192,7 @@ def extract_ablated_weight(folder_name: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--environment", type=str, required=True,
+    parser.add_argument("-e", "--environment", type=str, required=True,
                         help="Environment prefix, e.g. vmp")
     parser.add_argument("-f", "--folder", type=str, default="logs",
                         help="Logs folder prefix, e.g. logs")
@@ -274,31 +227,58 @@ def main():
     data = defaultdict(lambda: defaultdict(dict))
 
     for weight, run in weight_latest_run.items():
+        print("RUN", run, "SPLIT", args.split)
         yaml_file = load_latest_yaml_from_split_folder(run, args.split)
         if yaml_file is None:
             continue
 
         with open(yaml_file) as f:
             content = yaml.safe_load(f)
+        content = content["compression_statistics"]
 
         for graph_name, metrics in content.items():
+
+            node_stats = []
+            edge_stats = []
+
             for loss_name, stats in metrics.items():
-                # Determine the loss corresponding to the ablated weight
-                expected_loss_name = weight_to_lossname.get(weight, weight)
-                if loss_name == expected_loss_name:
-                    data[graph_name][weight][loss_name] = None
+
+                # Skip metrics that are not reconstruction losses
+                if loss_name == "CR_avg":
+                    continue
+
+                if loss_name == "adj_loss":
+                    data[graph_name][weight]["adj_loss"] = stats
+                    continue
+
+                # Every edge loss starts with "edge_"
+                if loss_name.startswith("edge_"):
+                    edge_stats.append(stats)
                 else:
-                    data[graph_name][weight][loss_name] = stats
+                    # Everything else is a node reconstruction loss
+                    node_stats.append(stats)
 
+            if node_stats:
+                data[graph_name][weight]["node_features_loss"] = {
+                    "mean": np.mean([s["mean"] for s in node_stats]),
+                    "ci95_lower": np.mean([s["ci95_lower"] for s in node_stats]),
+                    "ci95_upper": np.mean([s["ci95_upper"] for s in node_stats]),
+                }
 
+            if edge_stats:
+                data[graph_name][weight]["edge_features_loss"] = {
+                    "mean": np.mean([s["mean"] for s in edge_stats]),
+                    "ci95_lower": np.mean([s["ci95_lower"] for s in edge_stats]),
+                    "ci95_upper": np.mean([s["ci95_upper"] for s in edge_stats]),
+                }
 
     # For each graph type, create separate tables
     for graph_name, graph_data in data.items():
         rows = []
         for weight, losses in graph_data.items():
             for loss_name, stats in losses.items():
-                if stats is None:
-                    continue
+                #if stats is None:
+                #    continue
                 row = {
                     "ablated_weight": weight,
                     "loss": loss_name,
@@ -309,17 +289,14 @@ def main():
                     row["ci95_upper"] = stats["ci95_upper"]
                 rows.append(row)
 
+        print("\nRows:")
+        for r in rows:
+            print(r)
+
         df = pd.DataFrame(rows).sort_values(["loss", "ablated_weight"])
         # Normalize raw loss names (VERY IMPORTANT)
-        loss_rename_map = {
-            "binary_cat_loss": "node_feature_vector_binary_cat_loss",
-            "multi_cat_loss": "node_feature_vector_multi_cat_loss",
-            "cont_loss": "node_feature_vector_cont_loss",
-            "edge_continuous_loss": "edge_feature_vector_cont_loss",
-        }
-
-        df["loss"] = df["loss"].replace(loss_rename_map)
-
+        print(df)
+        print(df["loss"].unique())
         delta_matrix = build_delta_matrix(df)
 
         # Save delta CSV

@@ -240,7 +240,7 @@ class DiscreteEnv(gym.Env):
         if self.no_action_support:
             mask[len(actions)] = True  # last action is no-op
         if not mask.any():
-            raise RuntimeError("Empty action mask!")
+            self.done = True
 
         return mask
 

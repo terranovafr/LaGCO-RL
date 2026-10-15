@@ -4,6 +4,7 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 import random
 from gymnasium import spaces
 import numpy as np
@@ -32,6 +33,7 @@ class MVCEnv(DiscreteEnv):
                  max_sweeps=1000,
                  hard_constraints=False,
                  invalid_action_penalty=-1.0,
+                 revisiting=False,
                  **kwargs):
 
         super().pre_init(**kwargs)
@@ -42,6 +44,7 @@ class MVCEnv(DiscreteEnv):
         self.invalid_action_penalty = invalid_action_penalty
         self.hard_constraints = hard_constraints
         self.scenario_size = num_nodes
+        self.revisiting = revisiting
         # Placeholder for graph features (will compute in reset)
         obs_len = self.num_nodes + (self.num_nodes * (self.num_nodes - 1)) // 2  # 1 feature per node + edge features
         self.observation_space = spaces.Dict({
@@ -69,6 +72,25 @@ class MVCEnv(DiscreteEnv):
         sorted_nodes = sorted(degree_dict, key=degree_dict.get, reverse=True)
         return sorted_nodes
 
+    def _generate_random_cover(self):
+        """Generate and store a random feasible cover for the current graph."""
+
+        uncovered = {tuple(sorted(e)) for e in self.graph.edges}
+        cover = set()
+
+        while uncovered:
+            edge = random.choice(tuple(uncovered))
+            node = random.choice(edge)
+
+            cover.add(node)
+
+            uncovered = {
+                e for e in uncovered
+                if node not in e
+            }
+
+        self.initial_cover = cover
+
     def _generate_graph(self):
         self.graph = nx.erdos_renyi_graph(self.num_nodes, self.edge_prob)
         # Node features: {'selected': 0/1}
@@ -80,6 +102,16 @@ class MVCEnv(DiscreteEnv):
             self.graph.edges[u, v]['edge_attr_dict'] = {'covered': 0}
 
         self.remaining_edges = {tuple(sorted(e)) for e in self.graph.edges}
+        self.initial_cover = None
+
+    def compute_objective(self):
+
+        uncovered = len(self.remaining_edges)
+
+        return (
+                self.current_cover_size
+                + self.num_nodes * uncovered
+        )
 
     def estimate_bounds(self, max_sweeps=1000, top_k=3):
         # Simple heuristic: repeatedly select the node that covers the most uncovered edges until all edges are covered.
@@ -123,24 +155,76 @@ class MVCEnv(DiscreteEnv):
         return best_found, self.num_nodes
 
     def reset(self, **kwargs):
+        if self.revisiting:
+            return self.reset_revisiting(**kwargs)
+        else:
+            return self.reset_non_revisiting(**kwargs)
+
+    def reset_non_revisiting(self, **kwargs):
         super().pre_reset()
+
+        # Start from an empty cover
+        self.initial_cover = set()
+
         for n in self.graph.nodes:
-            self.graph.nodes[n]['x_dict'] = {'selected': 0}
-        for u, v in self.graph.edges:
-            self.graph.edges[u, v]['edge_attr_dict'] = {'covered': 0}
-        self.remaining_edges = {tuple(sorted(e)) for e in self.graph.edges}
+            self.graph.nodes[n]["x_dict"]["selected"] = 0
+
         self.current_cover_size = 0
+
+        # Recompute coverage
+        self._update_edge_coverage()
 
         self.prev_worst_case_edges = len(self.graph.edges)
         self.prev_worst_case_nodes = 0
+
+        self.steps = 0
+
+        self.previous_objective = self.compute_objective()
+
         self.obs = self._get_obs()
         self.info = {}
+
         super().post_reset()
+
         return self.obs, self.info
 
+    def reset_revisiting(self, **kwargs):
+        super().pre_reset()
+
+        self.initial_cover = set()
+
+        for n in self.graph.nodes:
+            self.graph.nodes[n]["x_dict"]["selected"] = 0
+
+        self.current_cover_size = 0
+        # IMPORTANT:
+        # _update_edge_coverage() also correctly rebuilds remaining_edges.
+        self._update_edge_coverage()
+
+        self.prev_worst_case_edges = len(self.graph.edges)
+        self.prev_worst_case_nodes = self.current_cover_size
+
+        self.steps = 0
+
+        self.previous_objective = self.compute_objective()
+
+        # Track best solution found during revisiting search
+        self.best_objective = self.previous_objective
+        self.best_cover = set(self.initial_cover)
+
+        self.obs = self._get_obs()
+        self.info = {}
+
+        super().post_reset()
+
+        return self.obs, self.info
+
+
     def update_config(self, config):
+        super().update_config(config)
         self.reward_type = config.get('reward_type', self.reward_type)
         self.hard_constraints = config.get('hard_constraints', self.hard_constraints)
+        self.revisiting = config.get('revisiting', self.revisiting if hasattr(self, 'revisiting') else False)
         # no need to rebuild action space
 
     def _get_obs(self):
@@ -158,33 +242,65 @@ class MVCEnv(DiscreteEnv):
 
     def is_valid_action(self, action):
         # In MVC, valid actions are selecting any node that hasn't been selected yet.
-        if action >= self.num_nodes:
-            return False
-        node = action
-        return self.graph.nodes[node]['x_dict']['selected'] == 0
+        if self.revisiting:
+            return 0 <= action < self.num_nodes
+        else:
+            if action >= self.num_nodes:
+                return False
+            node = action
+            return self.graph.nodes[node]['x_dict']['selected'] == 0
+
+    def _update_edge_coverage(self):
+        """Recompute which edges are covered from the current node selection."""
+
+        self.remaining_edges.clear()
+
+        for u, v in self.graph.edges:
+            covered = (
+                    self.graph.nodes[u]['x_dict']['selected'] or
+                    self.graph.nodes[v]['x_dict']['selected']
+            )
+
+            self.graph.edges[u, v]['edge_attr_dict']['covered'] = int(covered)
+
+            if not covered:
+                self.remaining_edges.add(tuple(sorted((u, v))))
 
     def step(self, node):
+        if self.revisiting:
+            return self.step_revisiting(node)
+        else:
+            return self.step_non_revisiting(node)
+
+    def step_non_revisiting(self, node):
         node = super().pre_step(node)
 
         if not self.invalid_action and not self.no_action:
-            duplicate_selection = self.graph.nodes[node]['x_dict']['selected'] == 1
+
+            duplicate_selection = (
+                    self.graph.nodes[node]['x_dict']['selected'] == 1
+            )
 
             if self.hard_constraints:
                 newly_covered = 0
+
                 if duplicate_selection:
                     self.reward = self.invalid_action_penalty
+
                 else:
-                    # Select node
                     self.graph.nodes[node]['x_dict']['selected'] = 1
                     self.current_cover_size += 1
-                    # Cover edges
+
                     for neighbor in self.graph.neighbors(node):
                         edge = tuple(sorted((node, neighbor)))
+
                         if self.graph.edges[edge]['edge_attr_dict']['covered'] == 0:
                             self.graph.edges[edge]['edge_attr_dict']['covered'] = 1
                             self.remaining_edges.discard(edge)
                             newly_covered += 1
-                    self.reward = newly_covered - 0.5 #(0.5 * num_nodes involved = 1)
+
+                    self.reward = newly_covered - 0.5
+
             else:
                 newly_covered = 0
 
@@ -194,24 +310,84 @@ class MVCEnv(DiscreteEnv):
 
                     for neighbor in self.graph.neighbors(node):
                         edge = tuple(sorted((node, neighbor)))
+
                         if self.graph.edges[edge]['edge_attr_dict']['covered'] == 0:
-                            self.graph.edges[edge]['edge_attr_dict']['covered'] = 1
+                            self.graph.edges[edge]['covered'] = 1
                             self.remaining_edges.discard(edge)
                             newly_covered += 1
-                    # ---- Soft reward formulation ----
-                    self.reward += (
-                            1.0 * newly_covered
-                            - 0.5 # small penalty for selecting a node (encourages smaller covers)
-                    )
+
+                    self.reward = newly_covered - 0.5
+
                 else:
-                    # small penalty for reselection
                     self.reward = self.invalid_action_penalty
 
+        # Constructive MVC terminates as soon as the cover is feasible
         self.done = len(self.remaining_edges) == 0
+
         self.obs = self._get_obs()
         self.info = {}
+
         super().post_step()
-        return self.obs, self.reward, self.done, self.truncated, self.info
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info,
+        )
+
+    def step_revisiting(self, node):
+        node = super().pre_step(node)
+
+        if not self.invalid_action and not self.no_action:
+
+            previous_objective = self.compute_objective()
+
+            selected = self.graph.nodes[node]['x_dict']['selected']
+
+            # Toggle node
+            if selected:
+                self.graph.nodes[node]['x_dict']['selected'] = 0
+                self.current_cover_size -= 1
+            else:
+                self.graph.nodes[node]['x_dict']['selected'] = 1
+                self.current_cover_size += 1
+
+            # Recompute coverage after the toggle
+            self._update_edge_coverage()
+
+            current_objective = self.compute_objective()
+
+            # Update best-so-far solution
+            if current_objective < self.best_objective:
+                self.best_objective = current_objective
+                self.best_cover = {
+                    n for n in self.graph.nodes
+                    if self.graph.nodes[n]["x_dict"]["selected"] == 1
+                }
+
+            self.previous_objective = current_objective
+            # Positive reward = improvement
+            self.reward = previous_objective - current_objective
+
+            self.previous_objective = current_objective
+
+        # Revisiting is search rather than constructive generation. Keep only cutoff truncated.
+
+        self.obs = self._get_obs()
+        self.info = {}
+
+        super().post_step()
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info,
+        )
+
 
     def update_metrics(self):
         super().update_metrics()
@@ -258,9 +434,14 @@ class ExtendedMVCEnv(MVCEnv, ContinuousEnv):
 
         # Action type: selecting a node
         if self.remove_invalid_actions:
-            self._action_type = {
-                'node': Node(graph_name='graph', spec={'selected': False})
-            }
+            if self.revisiting:
+                self._action_type = {
+                    'node': Node(graph_name='graph')
+                }
+            else:
+                self._action_type = {
+                    'node': Node(graph_name='graph', spec={'selected': False})
+                }
         else:
             self._action_type = {
                 'node': Node(graph_name='graph')
@@ -294,12 +475,18 @@ class ExtendedMVCEnv(MVCEnv, ContinuousEnv):
         self.action_candidates_reconstruction = False
         self.reconstruct_only_changed_nodes = False
         if self.remove_invalid_actions:
-            self.action_candidates_reconstruction = True
+            if self.revisiting:
+                self.action_candidates_reconstruction = False
+            else:
+                self.action_candidates_reconstruction = True
         self.action_space_reconstruction_each_step = True
 
     def sample_valid_action(self):
-        nodes_set = [n for n in range(self.num_nodes) if self.graph.nodes[n]['x_dict']['selected'] == 0]
-        return random.choice(nodes_set)
+        if self.revisiting:
+            return random.randrange(self.num_nodes)
+        else:
+            nodes_set = [n for n in range(self.num_nodes) if self.graph.nodes[n]['x_dict']['selected'] == 0]
+            return random.choice(nodes_set)
 
     def get_graphs(self):
         return {'graph': self.graph}

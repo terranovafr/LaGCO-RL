@@ -4,6 +4,13 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
+
+'''
+    assess_agent_generalization.py
+    This script runs a series of experiments to assess the generalization capabilities of reinforcement learning agents across different environments. It generates random environments, trains agents using various algorithms, and evaluates their performance on both training and testing sets.
+'''
+
 import json
 import random
 import numpy as np
@@ -162,6 +169,12 @@ def main():
         type=int,
         default=20,
     )
+    parser.add_argument(
+        "-gae",
+        type=str,
+        default="gae",
+        choices=["gae", "vgae"]
+    )
     parser.add_argument("--load_envs_mode", type=str, default=False)
     parser.add_argument('-ssa', '--sample_subset_actions', default=0,
                         help='How many to sample as a subset of actions at each step (only for continuous action spaces)')
@@ -184,6 +197,15 @@ def main():
         help="If set, only execute these run indices (1-based). "
              "Example: --runs_ids 1 3 5"
     )
+    parser.add_argument("--use_feature_vectors", action="store_true", help="If set, use feature vectors instead of raw observations for the agent")
+    parser.add_argument("--use_random_embeddings", action="store_true", help="If set, use random embeddings instead of learned embeddings for the agent")
+    parser.add_argument(
+        "--override_set",
+        nargs="+",
+        default=[],
+        help="List of config override groups"
+    )
+    parser.add_argument("--override_gae", action="store_true", help="If set, override GAE training with the provided override_set")
     # ===== Resource control =====
     parser.add_argument("--max_parallel_test", type=int, default=1)
 
@@ -362,11 +384,12 @@ def main():
             # ============================================================
             # 2. GAE TRAINING
             # ============================================================
-            if run_enabled and not args.skip_gae:
+            if run_enabled and not args.skip_gae and not args.override_gae:
                 cmd = [
                     "python3", os.path.join(script_dir, "..", "gae", "train_gae.py"),
                     "-e", args.environment,
                     "-ti", str(args.num_iter_gae),
+                    "-m", args.gae,
                     "--force_saving",
                     "--static_seed", str(current_seed) if current_seed is not None else 0,
                     "--name", f"{args.environment}_{run_key}"
@@ -402,54 +425,122 @@ def main():
                 if not args.skip_training:
                     for algorithm_type in args.algorithm_type:
                         algo_folder, copy_args = map_algorithm_type_to_original_and_override_args(algorithm_type, args)
+                        logs_folders.setdefault(algorithm_type, {})
 
-                        cmd = [
-                            "python3", os.path.join(script_dir, "..", "agents", "train_agent.py"),
-                            "-e", copy_args['environment'],
-                            "-at", copy_args['algorithm_type'],
-                            "-ti", str(copy_args['num_iter_rl']),
-                            "-algo", copy_args['algorithm'],
-                        ]
+                        override_sets = args.override_set or [""]
+                        for override_id, override_str in enumerate(override_sets):
+                            overrides = override_str.split()
 
-                        common_logs_folder = os.path.join(script_dir, "..", "agents", "logs", args.environment, algo_folder, common_logs_folder_name, "run_" + str(run_idx + 1))
-                        logs_folders[algo_folder] = common_logs_folder
-                        os.makedirs(common_logs_folder, exist_ok=True)
-                        cmd += ["--logs_folder", common_logs_folder]
-                        cmd += ["--static_seed", str(current_seed) if current_seed is not None else 0]
+                            if not args.skip_gae and args.override_gae:
+                                cmd = [
+                                    "python3", os.path.join(script_dir, "..", "gae", "train_gae.py"),
+                                    "-e", args.environment,
+                                    "-ti", str(args.num_iter_gae),
+                                    "-m", args.gae,
+                                    "--force_saving",
+                                    "--static_seed", str(current_seed) if current_seed is not None else 0,
+                                    "--name", f"{args.environment}_{run_key}"
+                                ]
+                                if overrides:
+                                    cmd += ["--override"]
+                                    cmd += overrides
+                                if args.validation:
+                                    cmd.append("--validation")
 
-                        if not copy_args['cuda']:
-                            cmd.append("--no_cuda")
-                        if copy_args['GNN_observations']:
-                            cmd += ["-GO"]
-                        if copy_args['approximate_distance']:
-                            cmd += ["-approx"]
-                        if copy_args['pca_minimum_without_loss']:
-                            cmd += ["--pca_minimum_without_loss"]
-                        if copy_args['semantic_ordering']:
-                            cmd += ["--semantic_ordering"]
-                        if args.load_envs_mode:
-                            cmd += ["--load_envs_mode", args.load_envs_mode]
+                                if args.load_envs_mode:
+                                    cmd += ["--load_envs_mode", args.load_envs_mode]
 
-                        if copy_args['sample_subset_actions']:
-                            cmd += ["--sample_subset_actions", str(args.sample_subset_actions)]
+                                if args.name:
+                                    cmd += ["--name", args.name]
 
-                        if args.validation:
-                            cmd.append("--validation")
+                                p = run(cmd)
+                                # add validation optional
+                                if p.wait() != 0:
+                                    sys.exit(1)
 
-                        if args.name:
-                            cmd += ["--name", args.name]
 
-                        train_start = time.perf_counter()
-                        p = run(cmd)
-                        if p.wait() != 0:
-                            sys.exit(1)
-                        train_end = time.perf_counter()
+                            cmd = [
+                                "python3", os.path.join(script_dir, "..", "agents", "train_agent.py"),
+                                "-e", copy_args['environment'],
+                                "-at", copy_args['algorithm_type'],
+                                "-ti", str(copy_args['num_iter_rl']),
+                                "-algo", copy_args['algorithm'],
+                            ]
+                            if overrides:
+                                cmd += ["--override"]
+                                cmd += overrides
 
-                        timings["env_sampling"][env_sampling]["runs"][run_key]["agent_training_seconds"][algorithm_type] = {
-                            "algo_folder": algo_folder,
-                            "seconds": train_end - train_start
-                        }
-                        save_timings()
+                            common_logs_folder = os.path.join(script_dir, "..", "agents", "logs", args.environment, algo_folder, common_logs_folder_name, "run_" + str(run_idx + 1))
+                            if override_str != "":
+                                override_name = (
+                                    override_str.replace("=", "_")
+                                                .replace(" ", "__")
+                                                .replace(".", "_")
+                                )
+                                common_logs_folder = os.path.join(common_logs_folder, f"override_{override_name}")
+                            key = override_str if override_str else "__default__"
+
+                            logs_folders.setdefault(algo_folder, {})
+                            logs_folders[algo_folder][key] = common_logs_folder
+                            os.makedirs(common_logs_folder, exist_ok=True)
+                            cmd += ["--logs_folder", common_logs_folder]
+                            cmd += ["--static_seed", str(current_seed) if current_seed is not None else 0]
+
+                            if not copy_args['cuda']:
+                                cmd.append("--no_cuda")
+                            if copy_args['GNN_observations']:
+                                cmd += ["-GO"]
+                            if copy_args['approximate_distance']:
+                                cmd += ["-approx"]
+                            if copy_args['pca_minimum_without_loss']:
+                                cmd += ["--pca_minimum_without_loss"]
+                            if copy_args['semantic_ordering']:
+                                cmd += ["--semantic_ordering"]
+                            if args.load_envs_mode:
+                                cmd += ["--load_envs_mode", args.load_envs_mode]
+
+                            if copy_args['sample_subset_actions']:
+                                cmd += ["--sample_subset_actions", str(args.sample_subset_actions)]
+                            if copy_args['use_feature_vectors']:
+                                cmd += ["--use_feature_vectors"]
+                            if copy_args['use_random_embeddings']:
+                                cmd += ["--use_random_embeddings"]
+                            if args.validation:
+                                cmd.append("--validation")
+
+                            if args.name:
+                                cmd += ["--name", args.name]
+
+                            train_start = time.perf_counter()
+                            p = run(cmd)
+                            if p.wait() != 0:
+                                sys.exit(1)
+                            train_end = time.perf_counter()
+
+                            timings["env_sampling"][env_sampling]["runs"][run_key] \
+                                ["agent_training_seconds"] \
+                                .setdefault(algorithm_type, {})
+
+                            if override_str != "":
+                                override_name = (
+                                    override_str.replace("=", "_")
+                                                .replace(" ", "__")
+                                                .replace(".", "_")
+                                )
+                                override_id = f"override_{override_name}"
+                                timings["env_sampling"][env_sampling]["runs"][run_key] \
+                                    ["agent_training_seconds"][algorithm_type][override_id] = {
+                                    "override": override_str,
+                                    "algo_folder": algo_folder,
+                                    "seconds": train_end - train_start,
+                                }
+                            else:
+                                timings["env_sampling"][env_sampling]["runs"][run_key] \
+                                    ["agent_training_seconds"][algorithm_type] = {
+                                    "algo_folder": algo_folder,
+                                    "seconds": train_end - train_start,
+                                }
+                            save_timings()
                 elif not args.skip_testing:
                     def extract_timestamp(folder_name):
                         import re
@@ -492,49 +583,52 @@ def main():
                     multiplier = args.number_episodes_per_env_test if solution == "test" else args.number_episodes_per_env_train
                     if multiplier == 0:
                         continue
+                    override_sets = args.override_set or [""]
                     for algorithm_type in args.algorithm_type:
-                        wait_for_slot(test_procs, args.max_parallel_test)
-                        algo_folder, copy_args = map_algorithm_type_to_original_and_override_args(algorithm_type, args)
-                        cmd = [
-                            "python3", os.path.join(script_dir, "..", "agents", "test_agent.py"),
-                            "-algo", copy_args['algorithm'],
-                            "-at", copy_args['algorithm_type'],
-                            "-e", copy_args['environment'],
-                            "-ne", str(multiplier * reference_number),
-                            "--last_checkpoint",
-                            "-o", "agent_performances",
-                        ]
-                        cmd += ["--logs_folder", logs_folders[algo_folder]]
-                        # no static seed during testing, it should load one different per episode
-                        if copy_args['GNN_observations']:
-                            cmd += ["-GO"]
-                        if not copy_args['cuda']:
-                            cmd.append("--no_cuda")
-                        if copy_args['approximate_distance']:
-                            cmd += ["-approx"]
-                        if copy_args['semantic_ordering']:
-                            cmd += ["--semantic_ordering"]
-                        if copy_args['pca_minimum_without_loss']:
-                            cmd += ["--pca_minimum_without_loss"]
+                        for override_str in override_sets:
+                            wait_for_slot(test_procs, args.max_parallel_test)
+                            algo_folder, copy_args = map_algorithm_type_to_original_and_override_args(algorithm_type, args)
+                            cmd = [
+                                "python3", os.path.join(script_dir, "..", "agents", "test_agent.py"),
+                                "-algo", copy_args['algorithm'],
+                                "-at", copy_args['algorithm_type'],
+                                "-e", copy_args['environment'],
+                                "-ne", str(multiplier * reference_number),
+                                "--last_checkpoint",
+                                "-o", "agent_performances",
+                            ]
+                            cmd += ["--logs_folder", logs_folders[algo_folder][override_str if override_str != "" else "__default__"]]
+                            # no static seed during testing, it should load one different per episode
+                            if copy_args['GNN_observations']:
+                                cmd += ["-GO"]
+                            if not copy_args['cuda']:
+                                cmd.append("--no_cuda")
+                            if copy_args['approximate_distance']:
+                                cmd += ["-approx"]
+                            if copy_args['semantic_ordering']:
+                                cmd += ["--semantic_ordering"]
+                            if copy_args['pca_minimum_without_loss']:
+                                cmd += ["--pca_minimum_without_loss"]
 
-                        if solution == "test":
-                            cmd.append("--load_default_test_envs")
-                        elif solution == "train":
-                            cmd.append("--load_default_train_envs")
+                            if solution == "test":
+                                cmd.append("--load_default_test_envs")
+                            elif solution == "train":
+                                cmd.append("--load_default_train_envs")
 
-                        if args.val_checkpoints:
-                            cmd.append("--val_checkpoints")
+                            if args.val_checkpoints:
+                                cmd.append("--val_checkpoints")
 
-                        test_start = time.perf_counter()
-                        proc = run(cmd)
-                        test_procs.append(proc)
-                        test_proc_metadata.append({
-                            "proc": proc,
-                            "algorithm_type": algorithm_type,
-                            "solution": solution,
-                            "algo_folder": algo_folder,
-                            "start_time": test_start,
-                        })
+                            test_start = time.perf_counter()
+                            proc = run(cmd)
+                            test_procs.append(proc)
+                            test_proc_metadata.append({
+                                "proc": proc,
+                                "algorithm_type": algorithm_type,
+                                "solution": solution,
+                                "algo_folder": algo_folder,
+                                "start_time": test_start,
+                                "override_str": override_str
+                            })
 
                 wait_all(test_procs)
 
@@ -548,11 +642,25 @@ def main():
                     if algo_name not in timings["env_sampling"][env_sampling]["runs"][run_key]["agent_testing_seconds"]:
                         timings["env_sampling"][env_sampling]["runs"][run_key]["agent_testing_seconds"][algo_name] = {}
 
-                    timings["env_sampling"][env_sampling]["runs"][run_key]["agent_testing_seconds"][algo_name][
-                        solution_name] = {
-                        "algo_folder": meta["algo_folder"],
-                        "seconds": elapsed
-                    }
+                    if meta["override_str"] != "":
+                        override_name = (
+                            meta["override_str"].replace("=", "_")
+                                                .replace(" ", "__")
+                                                .replace(".", "_")
+                        )
+                        override_id = f"override_{override_name}"
+                        timings["env_sampling"][env_sampling]["runs"][run_key]["agent_testing_seconds"][algo_name][
+                            override_id] = {
+                            "override": meta["override_str"],
+                            "algo_folder": meta["algo_folder"],
+                            "seconds": elapsed
+                        }
+                    else:
+                        timings["env_sampling"][env_sampling]["runs"][run_key]["agent_testing_seconds"][algo_name][
+                            solution_name] = {
+                            "algo_folder": meta["algo_folder"],
+                            "seconds": elapsed
+                        }
 
             timings["env_sampling"][env_sampling]["runs"][run_key][
                     "total_run_seconds"] = time.perf_counter() - run_global_start

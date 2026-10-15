@@ -8,7 +8,6 @@
     random_generator.py
     Script to generate random environments based on sampling specifications and split them based on complexity or other criteria
 """
-
 import os
 import random
 import yaml
@@ -19,6 +18,8 @@ from tqdm import tqdm
 import glob
 import sys
 import importlib
+import subprocess
+import re
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(script_dir, ".."))
 from utils.file_utils import load_yaml, save_yaml, load_json
@@ -455,9 +456,36 @@ def main():
                 env = None
                 config = None
                 print(f"[WARN] Failed to create environment with config: {config}. Retrying...")
-
         complexity, config = compute_complexity(config, env, sampling_spec)
         save_env(BASE_DIR, env, i, experiment_name, config)
+        if args.environment == "maxcut":
+            env.export_graph(os.path.join(os.path.join(out_dir, str(i)), f"maxcut_graph.txt"))
+        if args.environment == "tsp":
+            graph_path = os.path.join(out_dir, str(i), "tsp_graph.txt")
+            env.export_graph(graph_path)
+
+            graph_path = os.path.abspath(graph_path)
+            result = subprocess.run(
+                [
+                    os.path.expanduser("~/Downloads/concorde/TSP/concorde"),
+                    "-o",
+                    os.path.join(out_dir, str(i), "sol.txt"),
+                    graph_path,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+
+            output = result.stdout
+
+            m = re.search(r"Optimal Solution:\s*([0-9.]+)", output)
+            if m:
+                optimal_concorde = float(m.group(1))
+            else:
+                raise RuntimeError("Could not parse Concorde output:\n" + output)
+            env.set_optimal_length(optimal_concorde)
         features = compute_normalized_features(config, env, sampling_spec)
         feature_info = feature_extremeness_map(features, sampling_spec)
         extremeness = sum(v["extreme"] for v in feature_info.values()) / len(feature_info) if feature_info else 0
@@ -470,7 +498,12 @@ def main():
             "feature_info": feature_info,
             "extremeness": extremeness
         })
-
+        if args.environment == "maxcut":
+            env_infos[-1]["best_known_cut"] = float(env.best_cut)
+        if args.environment == "tsp":
+            env_infos[-1]["best_known_length"] = float(env.length_best)
+            env_infos[-1]["optimal_concorde"] = optimal_concorde
+            env.set_optimal_length(optimal_concorde)
     # Split and save
     split_info = assign_splits(env_infos, args.train_pct, args.val_pct, args.test_pct, args.split, sampling_spec)
     save_yaml(split_info, out_dir, "split.yaml")

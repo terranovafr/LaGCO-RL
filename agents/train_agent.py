@@ -16,6 +16,7 @@ import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import yaml
+import re
 from datetime import datetime
 from stable_baselines3.common.callbacks import CheckpointCallback
 import numpy as np
@@ -27,10 +28,10 @@ from torch.distributions import Distribution
 Distribution.set_default_validate_args(False)
 import torch
 from tqdm import tqdm
-from utils.train_utils import check_args, replace_with_classes, derive_env_type_folder_name, replace_with_strings, algorithm_models, recurrent_algorithms
+from utils.train_utils import check_args, apply_overrides, replace_with_classes, derive_env_type_folder_name, replace_with_strings, algorithm_models, recurrent_algorithms
 from utils.file_utils import load_yaml, save_yaml, extract_metric_data
 from utils.log_utils import setup_logging
-from utils.math_utils import set_seeds, calculate_auc, linear_schedule
+from utils.math_utils import set_seeds, calculate_auc #, linear_schedule
 from sb3_sa_contrib.policies import StateActionDQNPolicy
 from sb3_sa_contrib.buffers import DictReplayBufferWithNextActions
 from envs.env_switcher import GraphEnvSwitcher
@@ -82,7 +83,9 @@ def train_rl_algorithm(args, logs_folder, envs_folder, config, train_ids, val_id
             config['policy_kwargs'] = replace_with_strings(config['policy_kwargs'])
             if 'envs_vectorized' in config:
                 del config['envs_vectorized']
-            save_yaml(config, logs_folder, "train_config.yaml")
+            copy_config = config.copy()
+            copy_config.pop("projection_agent", None)
+            save_yaml(copy_config, logs_folder, "train_config.yaml")
             config['policy_kwargs'] = replace_with_classes(config['policy_kwargs'])
 
         train_model(envs_switcher, args, logs_folder, config, run_id+1, logger=logger, verbose=verbose)
@@ -117,7 +120,8 @@ def train_model(switch_envs, args, logs_folder, config, run_id, logger=None, ver
     algorithm_config = copy.deepcopy(config['algorithm_hyperparams'])
     if len(algorithm_config) != 0:
         if algorithm_config['learning_rate_type'] == "linear":
-            learning_rate = linear_schedule(algorithm_config['learning_rate'], algorithm_config['learning_rate_final'])
+            learning_rate = algorithm_config['learning_rate']
+            #learning_rate = linear_schedule(algorithm_config['learning_rate'], algorithm_config['learning_rate_final'])
         else: # constant learning rate
             learning_rate = algorithm_config['learning_rate']
 
@@ -261,12 +265,11 @@ def setup_train_via_args(args, general_config, logs_folder=None, envs_folder=Non
     else:
         config['algorithm_hyperparams'] = algorithm_config.get(args.algorithm, {})
 
-
-
     config['policy_kwargs'] = algorithm_config['policy_kwargs']
 
     config.update(vars(args))  # put all arguments in the configuration dict only if yaml not loaded, otherwise overwrite
     config.update(env_config)
+    config = apply_overrides(config, args.override)
 
     # possible to concatenate actions in the observation vector only if present in fixed number
     if not config['sample_subset_actions']:
@@ -276,7 +279,8 @@ def setup_train_via_args(args, general_config, logs_folder=None, envs_folder=Non
     if args.environment in config:
         config.update(config[args.environment])
     if args.algorithm_type in config:
-        config.update(config[args.algorithm_type])
+        if not (args.algorithm_type == "iterative" and config['projection_agent']):
+            config.update(config[args.algorithm_type])
 
     if suggested_params:
         config.update(suggested_params)
@@ -347,6 +351,7 @@ def setup_train_via_args(args, general_config, logs_folder=None, envs_folder=Non
         encoders = None
     # Saving configurations to ensure reproducibility
     copy_config = {k: v for k, v in config.items() if not (isinstance(v, dict) and 'key' in v)}
+    copy_config.pop('projection_agent', None)
     save_yaml(copy_config, logs_folder, "train_config.yaml")
     if config['load_envs']: # environments to be processed from a folder in samples
         if config['verbose']:
@@ -408,6 +413,7 @@ def setup_train_via_args(args, general_config, logs_folder=None, envs_folder=Non
     yaml_split_path = os.path.join(envs_folder, "split.yaml")
     with open(yaml_split_path, 'r') as file:
         yaml_info = yaml.safe_load(file)
+
     if config['validation']:
         train_ids = []
         for elem in yaml_info['training_set']:
@@ -428,7 +434,6 @@ def setup_train_via_args(args, general_config, logs_folder=None, envs_folder=Non
         test_ids = []
         for elem in yaml_info.get('test_set', []):
             test_ids.append(elem['id'])
-
     # save split information in logs
     save_yaml(yaml_info, logs_folder, "split.yaml")
 
@@ -450,10 +455,14 @@ if __name__ == "__main__":
                         help='Type of environment application to be used for training')  # to be extended in the future to LOCAL or DISCRETE or others
     parser.add_argument("--use_feature_vectors", action='store_true', default=False,
                         help="Whether to use feature vectors as action points in the case of continuous action spaces instead of embeddings")
+    parser.add_argument("--use_random_embeddings", action='store_true', default=False,
+                        help="Whether to use random vectors as node embeddings in the case of continuous action spaces instead of embeddings")
     parser.add_argument('-ti', '--train_iterations', type=int, default=1000,
                         help='Number of training iterations overall')
     parser.add_argument("-pca", "--pca_percentage_target", type=float, default=1,
                         help="Do PCA dimensionality reduction on the action space")
+    parser.add_argument("-proto", "--proto_knn", type=int, default=0,
+                        help="Add protoKNN training off-policy module with K neighbors (0 to disable)")
     parser.add_argument("-ssa", "--sample_subset_actions", type=int, default=0,
                         help="Whether to sample a subset of actions at each step for the agent to choose from (only for continuous action spaces, and if > 0)")
     parser.add_argument("-pca_min", "--pca_minimum_without_loss", default=False, action='store_true',
@@ -472,6 +481,8 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--verbose', default=2, type=int, help='Verbose level: 0 - no output, 1 - training/validation information, 2 - episode level information, 3 - iteration level information')
     parser.add_argument('-f', '--logs_folder', type=str, default=None,
                         help='Path to the logs folder where to save training information')
+    parser.add_argument('-pa', '--projection_agent', action="store_true",
+                        help='Path to the projection agent folder, to be used to restrict the action space of the agent')
     parser.add_argument("-approx", "--approximate_distance", default=False,
                         type=bool, help="Approximate distance for the projection approach")
     parser.add_argument('-gae', '--gae_folder', type=str, default=None,
@@ -488,7 +499,15 @@ if __name__ == "__main__":
                         help='Path to the configuration YAML file')
     parser.add_argument('--algo_config', type=str, default='config/algo_config.yaml',
                         help='Path to the configuration YAML file')
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help="Override config values. Example: --override train_iterations=5000 validation=true algorithm_hyperparams.gamma=0.99"
+    )
     args = parser.parse_args()
+    if args.use_feature_vectors and args.use_random_embeddings:
+        raise ValueError("Cannot use both feature vectors and random embeddings. Please choose one.")
 
     general_config = load_yaml(os.path.join(script_dir, "..", "config.yaml"))
     if not args.load_envs:
@@ -512,6 +531,44 @@ if __name__ == "__main__":
     valid, message = check_args(args)
     if not valid:
         raise ValueError(message)
+
+
+    if args.projection_agent:
+        projection_base_logs_dir = os.path.join(
+            script_dir,
+            'logs',
+            args.environment,
+            "projection"
+        )
+
+        run_dirs = [
+            os.path.join(projection_base_logs_dir, d)
+            for d in os.listdir(projection_base_logs_dir)
+            if os.path.isdir(os.path.join(projection_base_logs_dir, d))
+        ]
+
+        if not run_dirs:
+            raise FileNotFoundError(f"No log folders found in {projection_base_logs_dir}")
+
+        # for each masking run, take the train_config.yaml file inside the folder and check the key algorithm
+        refined_matching_runs = []
+        for run_dir in run_dirs:
+            train_config_path = os.path.join(run_dir, f"train_config.yaml")
+            if os.path.exists(train_config_path):
+                with open(train_config_path, 'r') as f:
+                    train_config = yaml.safe_load(f)
+                if train_config['algorithm'] != "idqn" and train_config['algorithm_type'] == "projection":
+                    refined_matching_runs.append(run_dir)
+        # Pick the most recently created matching run
+        projection_agent_path = max(refined_matching_runs, key=os.path.getctime)
+        projection_agent_files = sorted([f for f in os.listdir(os.path.join(projection_agent_path, "checkpoints", "1")) if
+                 f.startswith("checkpoint_")],
+                key=lambda x: int(re.search(r'checkpoint_(\d+)', x).group(1)))
+        projection_agent_file = projection_agent_files[-1]
+        projection_agent_path = os.path.join(projection_agent_path, "checkpoints", "1", projection_agent_file)
+        args.projection_agent = algorithm_models[train_config['algorithm']].load(projection_agent_path)
+        if args.proto_knn != 0:
+            args.knn = args.proto_knn
 
     logger, logs_folder, envs_folder, config, train_ids, val_ids, test_ids = setup_train_via_args(args, general_config, args.logs_folder)
     # Train the RL algorithm with the provided configuration

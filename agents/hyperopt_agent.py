@@ -9,6 +9,11 @@
     Script to hyper-optimize an algorithm on a set of environments with Optuna.
 """
 
+"""
+    hyperopt_agent.py
+    Script to hyper-optimize an algorithm on a set of environments with Optuna.
+"""
+
 import argparse
 import copy
 import sys
@@ -161,6 +166,8 @@ if __name__ == "__main__":
                         type=bool, help="Approximate distance for the projection approach")
     parser.add_argument('--finetune_model', type=str,
                         help='Path to the model to eventually finetune (relative to the logs folder)')
+    parser.add_argument('-pa', '--projection_agent', action="store_true",
+                        help='Path to the projection agent folder, to be used to restrict the action space of the agent')
     parser.add_argument('--early_stopping', type=int, default=0,
                         help='Early stopping on the validation environments setting the number of patience runs')
     parser.add_argument('--name', default=False, help='Name of the logs folder related to the run')
@@ -193,6 +200,12 @@ if __name__ == "__main__":
                         help='Path to the configuration YAML file')
     parser.add_argument('--algo_config', type=str, default='config/algo_config.yaml',
                         help='Path to the configuration YAML file')
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help="Override config values. Example: --override train_iterations=5000 validation=true algorithm_hyperparams.gamma=0.99"
+    )
     # hyperopt specific arguments
     parser.add_argument('--optimization_type', type=str, choices=['grid', 'random', 'tpe', 'cmaes', 'GPS', 'partial_fixed', 'nsga2', 'nsga3', 'qmc', 'bruteforce'], default='tpe',
                         help='Type of hyperparameter optimization to use')

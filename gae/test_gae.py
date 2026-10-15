@@ -4,11 +4,12 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
+
 """
     test_gae.py
-    Script to evaluate a trained GAE/VGAE and compute compression ratios with confidence intervals.
+    Evaluate a trained GAE/VGAE and compute compression ratios with confidence intervals.
 """
-
 from datetime import datetime
 import argparse
 import os
@@ -30,6 +31,14 @@ from utils.math_utils import ci
 script_dir = Path(__file__).parent
 torch.set_default_dtype(torch.float32)
 
+def model_checksum(model):
+    with torch.no_grad():
+        return float(sum(p.abs().sum() for p in model.parameters()))
+
+def reset_weights(module):
+    """Force a fresh random initialization of every layer."""
+    if hasattr(module, "reset_parameters"):
+        module.reset_parameters()
 
 def load_trained_gaes(gae_logs_folder, validation=False, random_init=False):
     models = {}
@@ -90,7 +99,14 @@ def load_trained_gaes(gae_logs_folder, validation=False, random_init=False):
         else:
             raise ValueError(f"Unknown model_type {config['model_type']}")
 
-        if not random_init:
+        if random_init:
+            model.apply(reset_weights)
+
+            # (optional) sanity check
+            with torch.no_grad():
+                checksum = sum(p.abs().sum().item() for p in model.parameters())
+            print(f"[Random init] {graph_name} checksum = {checksum:.6f}")
+        else:
             model.load_state_dict(torch.load(model_path))
         model.eval()
 
@@ -338,8 +354,16 @@ if __name__ == "__main__":
     envs_switcher = build_env_switcher(os.path.join(args.logs_folder, "envs"), os.path.join(args.logs_folder, "split.yaml"), args.split, test_config)
 
     baseline_losses_list = []
-    for _ in tqdm(range(args.num_random_inits)):
-        rand_models, _, _ = load_trained_gaes(args.logs_folder, random_init=True)
+    for seed in range(args.num_random_inits):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        rand_models, _, _ = load_trained_gaes(
+            args.logs_folder,
+            random_init=True,
+        )
+
         baseline_losses_list.append(
             compute_losses_for_envs(rand_models, envs_switcher, configs, args.num_episodes)
         )
@@ -404,13 +428,43 @@ if __name__ == "__main__":
                 "ci95_upper": hi,
             }
 
+    baseline_checksums = []
+    baseline_seeds = list(range(args.num_random_inits))
+    for _ in tqdm(range(args.num_random_inits)):
+        rand_models, _, _ = load_trained_gaes(
+            args.logs_folder,
+            random_init=True,
+        )
+
+        baseline_checksums.append(
+            {g: model_checksum(m) for g, m in rand_models.items()}
+        )
+
+        baseline_losses_list.append(
+            compute_losses_for_envs(
+                rand_models,
+                envs_switcher,
+                configs,
+                args.num_episodes,
+            )
+        )
+
     # -------- Save --------
     out_dir = os.path.join(args.logs_folder, "test", args.split)
     os.makedirs(out_dir, exist_ok=True)
 
     out_file = os.path.join(out_dir, f"compression_{datetime.now():%Y%m%d_%H%M%S}.yaml")
 
+    results = {
+        "trained_losses": trained_losses,
+        "baseline_losses": baseline_losses_list,
+        "baseline_checksums": baseline_checksums,
+        "compression_samples": compression,
+        "compression_statistics": compression_with_ci,
+        "baseline_seeds": baseline_seeds,
+    }
+
     with open(out_file, "w") as f:
-        yaml.dump(compression_with_ci, f, sort_keys=False)
+        yaml.dump(results, f, sort_keys=False)
 
     print(f"\n✅ Saved compression + CI to {out_file}")

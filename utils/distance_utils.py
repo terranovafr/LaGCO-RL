@@ -9,9 +9,63 @@
     This module contains utility functions for distance components.
 '''
 
-import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import random
+import numpy as np
+
+def mahalanobis_distance(query_vec, action_dict, std_dict):
+    mu = np.array(list(action_dict.values()))
+    std = np.array([std_dict[id] for id in action_dict])
+
+    # continue with the Mahalanobis computation...
+    eps = 1e-8
+    var = std ** 2 + eps
+
+    diff = mu - query_vec[None, :]
+
+    dists = np.sum((diff ** 2) / var, axis=1)
+
+    return dists
+
+def wasserstein_distance(query_vec, action_dict, std_dict):
+    mu = np.array(list(action_dict.values()))
+    std = np.array([std_dict[id] for id in action_dict])
+
+    diff = mu - query_vec[None, :]
+
+    dists = np.sum(diff ** 2, axis=1) + np.sum(std ** 2, axis=1)
+
+    return dists
+
+def gaussian_distance(query_vec, action_dict, std_dict):
+    mu = np.array(list(action_dict.values()))
+    std = np.array([std_dict[id] for id in action_dict])
+
+    eps = 1e-8
+    var = std ** 2 + eps
+
+    diff = mu - query_vec[None, :]
+
+    # negative log likelihood (up to constant)
+    dists = 0.5 * np.sum((diff ** 2) / var + np.log(var), axis=1)
+
+    return dists
+
+def energy_distance(query_vec, action_dict, std_dict):
+    mu = np.array(list(action_dict.values()))
+    std = np.array([std_dict[id] for id in action_dict])
+
+    eps = 1e-8
+    var = std ** 2 + eps
+
+    diff = mu - query_vec[None, :]
+
+    mahal = np.sum((diff ** 2) / var, axis=1)
+    uncertainty_penalty = np.sum(np.log(std + eps), axis=1)
+
+    dists = mahal - uncertainty_penalty
+
+    return dists
 
 def sample_farthest_k_points(action_dict, k):
     '''

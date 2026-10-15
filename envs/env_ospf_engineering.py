@@ -4,6 +4,7 @@
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+
 import copy
 from gymnasium import spaces
 import itertools
@@ -49,6 +50,7 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
                  always_feasible=False,
                  max_sweeps=1000,
                  terminate_at_approximate_best=False,
+                 revisiting=False,
                  **kwargs):
         super().pre_init(**kwargs)
         self.num_nodes = num_nodes
@@ -73,6 +75,10 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
         self.bounded_weights = bounded_weights
         self.max_sweeps = max_sweeps
         self.terminate_at_approximate_best = terminate_at_approximate_best
+        self.revisiting = revisiting
+        self.final_weights = list(
+            range(self.min_weight, self.max_weight + 1)
+        )
 
         if self.verbose > 0:
             print("Initializing OSPF Engineering Environment with parameters:")
@@ -239,9 +245,18 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
 
     def build_action_list(self):
         action_list = []
-        for edge in self.communication_links:
-            for var in self.variations:
-                action_list.append((edge, var))
+        if self.revisiting:
+            # Existing ECO-style action:
+            # edge + variation
+            for edge in self.communication_links:
+                for variation in self.variations:
+                    action_list.append((edge, variation))
+        else:
+            # Constructive action:
+            # edge + FINAL weight
+            for edge in self.communication_links:
+                for weight in self.final_weights:
+                    action_list.append((edge, weight))
         return action_list
 
     def _initialize_empirical_worst_allocation(self, sweep_values=None, max_sweeps=1000):
@@ -487,8 +502,79 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
         return self.best_util != self.worst_util
 
     def reset(self, **kwargs):
+        if self.revisiting:
+            return self.reset_revisiting(**kwargs)
+        else:
+            return self.reset_non_revisiting(**kwargs)
+
+    def reset_non_revisiting(self, **kwargs):
+
+        super().pre_reset()
+        self.total_edge_selections = 0
+        self.unique_edge_selections = set()
+        self.repeated_edge_selections = 0
+        self.communication_graph = copy.deepcopy(
+            self.initial_communication_graph
+        )
+
+        # Same original routing evaluation
+        if self.routing_ecmp:
+            feasible, link_utils, self.initial_feasible_percentage = (
+                self._find_feasible_shortest_paths_ECMP()
+            )
+        else:
+            feasible, link_utils, _, self.initial_feasible_percentage = (
+                self._find_feasible_shortest_paths()
+            )
+
+        if self.util_aggregation == 'max':
+            self.initial_util = max(link_utils.values()) if link_utils else 0.0
+        else:
+            self.initial_util = (
+                np.mean(list(link_utils.values()))
+                if link_utils else 0.0
+            )
+
+        self.prev_feasible_percentage = (
+            self.initial_feasible_percentage
+        )
+        self.prev_util = self.initial_util
+        self.current_util = self.initial_util
+        self.initial_feasible = 1 if feasible else 0
+
+        # New constructive bookkeeping
+        self.visited_edges = set()
+        self.steps = 0
+
+        # Existing bookkeeping
+        self.increase_actions = 0
+        self.decrease_actions = 0
+        self.real_increase_actions = 0
+        self.real_decrease_actions = 0
+        self.no_variation_actions = 0
+        self.real_no_variation_actions = 0
+        self.real_no_change_actions = 0
+
+        self.targeted_edges = set()
+        self.targeted_positive_variations = set()
+        self.targeted_negative_variations = set()
+
+        self.action_list = self.build_action_list()
+        self.semantic_action_list = self.build_semantic_action_list()
+
+        self.obs = self._get_obs()
+        self.info = {}
+
+        super().post_reset()
+
+        return self.obs, self.info
+
+    def reset_revisiting(self, **kwargs):
         # Reset weights and data structures, but keep the same graph and traffic pattern for consistency across episodes
         super().pre_reset()
+        self.total_edge_selections = 0
+        self.unique_edge_selections = set()
+        self.repeated_edge_selections = 0
         self.communication_graph = copy.deepcopy(self.initial_communication_graph)
         if self.routing_ecmp:
             feasible, link_utils, self.initial_feasible_percentage = self._find_feasible_shortest_paths_ECMP()
@@ -505,6 +591,7 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
         self.initial_feasible = 1 if feasible else 0
 
         self.current_util = self.initial_util
+        self.visited_edges = set()
         self.increase_actions = 0
         self.decrease_actions = 0
         self.real_increase_actions = 0
@@ -529,7 +616,12 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
             edge_features.append(self.traffic_graph[u][v]['edge_attr_dict']['traffic'])
         return {"graph": np.array(edge_features).astype(np.float32)}
 
-    def update_config(self, config):
+    def update_config(self,
+                      config):
+        super().update_config(config)
+        self.total_edge_selections = 0
+        self.unique_edge_selections = set()
+        self.repeated_edge_selections = 0
         self.feasibility_coefficient = config.get('feasibility_coefficient', self.feasibility_coefficient)
         self.link_util_coefficient = config.get('link_util_coefficient', self.link_util_coefficient)
         self.util_aggregation = config.get('util_aggregation', self.util_aggregation)
@@ -538,6 +630,7 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
         self.no_change_action_sum = config.get('no_change_action_sum', self.no_change_action_sum)
         self.reward_type = config.get('reward_type', self.reward_type)
         self.bounded_weights = config.get('bounded_weights', self.bounded_weights)
+        self.revisiting = config.get('revisiting', self.revisiting if hasattr(self, 'revisiting') else False)
         if self.incremental_weight_by_unit:
             # add variations by unit as -half range max -min, 0, +half range max -min
             self.variations = [-1, 0, 1]
@@ -545,10 +638,14 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
             max_negative = -(self.max_weight - self.min_weight)
             max_positive = (self.max_weight - self.min_weight)
             self.variations = list(range(max_negative, max_positive + 1))
+        self.final_weights = list(
+            range(self.min_weight, self.max_weight + 1)
+        )
         # need to rebuild action list if variations changed
         self.action_list = self.build_action_list()
         self.semantic_action_list = self.build_semantic_action_list()
-
+        self.visited_edges = set()
+        self.post_init()
 
     def build_semantic_action_list(self):
         # heuristic: sort edges by current utilization (descending) and variations by absolute value (descending) to prioritize impactful actions
@@ -565,11 +662,21 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
             self.variations,
             reverse=True
         )
-        mapping = []
-        # Semantic cartesian product
-        for edge in sorted_edges:
-            for var in sorted_variations:
-                mapping.append((edge, var))
+        sorted_weights = sorted(
+            self.final_weights,
+            reverse=True
+        )
+        if self.revisiting:
+            mapping = []
+            # Semantic cartesian product
+            for edge in sorted_edges:
+                for var in sorted_variations:
+                    mapping.append((edge, var))
+        else:
+            mapping = []
+            for edge in sorted_edges:
+                for weight in sorted_weights:
+                    mapping.append((edge, weight))
         return mapping
 
     def save_step_log(self):
@@ -592,9 +699,195 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
             },
         })
 
-    def step(self, edge, variation=None):
+    def step(self, edge, value=None):
+
+        if self.revisiting:
+            return self.step_revisiting(edge, value)
+        else:
+            return self.step_non_revisiting(edge, value)
+
+    def step_non_revisiting(self, edge, final_weight=None):
+
+        action = super().pre_step((edge, final_weight))
+
+        if not self.no_action and not self.invalid_action:
+
+            edge, final_weight = action
+
+            if isinstance(edge, str):
+                u, v = map(int, edge.split("_")[1:3])
+            else:
+                u, v = edge[0], edge[1]
+
+            u, v = self._canon_link(u, v)
+            edge_key = (u, v)
+
+            # --------------------------------------------------
+            # NON-REVISITING SANITY CHECK
+            # --------------------------------------------------
+            if edge_key in self.visited_edges:
+                raise RuntimeError(
+                    f"Non-revisiting violation: edge {edge_key} "
+                    f"was selected again at step {self.current_step}. "
+                    f"Visited edges: {self.visited_edges}"
+                )
+
+            # This should ALWAYS be zero in non-revisiting mode.
+            self.total_edge_selections += 1
+
+            if edge_key in self.unique_edge_selections:
+                raise RuntimeError(
+                    f"Duplicate edge selection detected in non-revisiting mode: "
+                    f"{edge_key}"
+                )
+
+            self.unique_edge_selections.add(edge_key)
+            # --------------------------------------------------
+            # This is a FINAL value, not a variation.
+            # --------------------------------------------------
+            final_weight = int(final_weight)
+
+            # Make sure the requested final value is valid
+            if not (
+                    self.min_weight <= final_weight <= self.max_weight
+            ):
+                self.reward = self.no_change_action_sum
+            else:
+                # Apply final value
+                self._set_link_attr(
+                    u, v,
+                    'weight',
+                    final_weight
+                )
+
+                # Edge is now fixed
+                self.visited_edges.add(edge_key)
+
+                # --------------------------------------------------
+                # Recompute routing exactly as your existing step
+                # --------------------------------------------------
+
+                if self.routing_ecmp:
+                    (
+                        self.current_feasible,
+                        link_utils,
+                        self.current_feasible_percentage
+                    ) = self._find_feasible_shortest_paths_ECMP()
+                else:
+                    (
+                        self.current_feasible,
+                        link_utils,
+                        _,
+                        self.current_feasible_percentage
+                    ) = self._find_feasible_shortest_paths()
+
+                for (link_u, link_v), util in link_utils.items():
+
+                    self._set_link_attr(
+                        link_u,
+                        link_v,
+                        'used_capacity',
+                        util * self.communication_graph[
+                            link_u
+                        ][link_v]['edge_attr_dict']['capacity']
+                    )
+
+                if self.util_aggregation == 'max':
+                    self.current_util = (
+                        max(link_utils.values())
+                        if link_utils else 0.0
+                    )
+                else:
+                    self.current_util = (
+                        np.mean(list(link_utils.values()))
+                        if link_utils else 0.0
+                    )
+
+                # --------------------------------------------------
+                # SAME reward logic as original environment
+                # --------------------------------------------------
+
+                if self.reward_type == 'relative':
+
+                    delta_feasible = (
+                            self.current_feasible_percentage
+                            - self.prev_feasible_percentage
+                    )
+
+                    delta_denom = (
+                            self.initial_util - self.best_util
+                    )
+
+                    if delta_denom == 0:
+                        delta_denom = 1
+
+                    delta_util = (
+                                         self.prev_util - self.current_util
+                                 ) / delta_denom
+
+                    self.reward = (
+                            self.feasibility_coefficient * delta_feasible
+                            + self.link_util_coefficient * delta_util
+                    )
+
+                    if self.reward == 0:
+                        self.real_no_change_actions += 1
+
+                        self.reward = (
+                                self.no_change_action_sum /
+                                min(
+                                    self.max_steps_overall,
+                                    self.max_steps_coefficient
+                                    * len(self.communication_graph.edges)
+                                )
+                        )
+
+                elif self.reward_type == 'absolute':
+
+                    self.reward = (
+                            self.feasibility_coefficient
+                            * self.current_feasible_percentage
+                            - self.link_util_coefficient
+                            * self.current_util
+                    )
+
+                self.prev_util = self.current_util
+                self.prev_feasible_percentage = (
+                    self.current_feasible_percentage
+                )
+
+        # ------------------------------------------------------
+        # Constructive termination
+        # ------------------------------------------------------
+        self.done = (
+                len(self.visited_edges)
+                >= len(self.communication_links)
+        )
+
+        if self.terminate_at_approximate_best:
+            self.done |= (
+                    self.current_util <= self.best_util
+            )
+
+        self.action = (edge, final_weight)
+
+        self.obs = self._get_obs()
+        self.info = {}
+
+        self.post_step()
+
+        return (
+            self.obs,
+            self.reward,
+            self.done,
+            self.truncated,
+            self.info
+        )
+
+    def step_revisiting(self, edge, variation=None):
         # Step action: adjust weight of chosen edge by variation, then recompute shortest paths and link utilizations to calculate reward
         action = super().pre_step((edge, variation))
+
         if not self.no_action and not self.invalid_action:
             edge, variation = action if action is not None else (edge, variation)
 
@@ -605,7 +898,14 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
 
             # canonicalize edge representation for symmetric
             u, v = self._canon_link(u, v)
+            edge_key = (u, v)
 
+            self.total_edge_selections += 1
+
+            if edge_key in self.unique_edge_selections:
+                self.repeated_edge_selections += 1
+
+            self.unique_edge_selections.add(edge_key)
             if variation > 0:
                 self.increase_actions += 1
             elif variation < 0:
@@ -804,33 +1104,145 @@ class OSPFTrafficEngineeringEnv(DiscreteEnv):
         return utilizations
 
     def update_metrics(self):
+        super().update_metrics()
+
+        total_steps = self.current_step
+
+        unique_edges = len(self.unique_edge_selections)
+        repeated_edges = self.repeated_edge_selections
+
         self._metrics.update({
+            # -------------------------
+            # Performance
+            # -------------------------
             'initial_link_utilization': self.initial_util,
             'current_link_utilization': self.current_util,
-            'ideal_reduction_percentage_relative': (self.initial_util - self.current_util) / (self.initial_util - self.best_util) if (self.initial_util - self.best_util) > 0 else 0.0,
-            'link_utilization_difference': self.current_util - self.initial_util,
-            'feasible_difference': self.current_feasible - self.initial_feasible,
-            'feasibility_percentage_difference': self.current_feasible_percentage - self.initial_feasible_percentage,
-            'decrease_actions': self.decrease_actions/self.current_step if self.current_step > 0 else 0.0,
-            'increase_action': self.increase_actions/self.current_step if self.current_step > 0 else 0.0,
-            'no_variation_actions': self.no_variation_actions/self.current_step if self.current_step > 0 else 0.0,
-            'real_decrease_actions': self.real_decrease_actions/self.current_step if self.current_step > 0 else 0.0,
-            'real_increase_action': self.real_increase_actions/self.current_step if self.current_step > 0 else 0.0,
-            'real_no_variation_actions': self.real_no_variation_actions/self.current_step if self.current_step > 0 else 0.0,
-            'real_no_change_actions': self.real_no_change_actions/self.current_step if self.current_step > 0 else 0.0,
-            'targeted_edges': len(self.targeted_edges)/self.num_communication_edges,
-            'targeted_positive_variations': len(self.targeted_positive_variations)/len([v for v in self.variations if v > 0]) if len([v for v in self.variations if v > 0]) > 0 else 0.0,
-            'targeted_negative_variations': len(self.targeted_negative_variations)/len([v for v in self.variations if v < 0]) if len([v for v in self.variations if v < 0]) > 0 else 0.0,
+
+            'ideal_reduction_percentage_relative': (
+                (self.initial_util - self.current_util) /
+                (self.initial_util - self.best_util)
+                if (self.initial_util - self.best_util) > 0
+                else 0.0
+            ),
+
+            'link_utilization_difference':
+                self.current_util - self.initial_util,
+
+            'feasible_difference':
+                self.current_feasible - self.initial_feasible,
+
+            'feasibility_percentage_difference':
+                self.current_feasible_percentage -
+                self.initial_feasible_percentage,
+
+            # -------------------------
+            # Revisiting diagnostics
+            # -------------------------
+
+            # How many different physical links were touched?
+            'unique_edges_selected':
+                unique_edges,
+
+            # Total number of edge-selection actions
+            'total_edge_selections':
+                self.total_edge_selections,
+
+            # Number of times an already-selected edge was selected again
+            'repeated_edge_selections':
+                repeated_edges,
+
+            # Fraction of actions that were revisits
+            'revisit_rate':
+                repeated_edges / total_steps
+                if total_steps > 0 else 0.0,
+
+            # Fraction of links that have been touched
+            'edge_coverage':
+                unique_edges / self.num_communication_edges
+                if self.num_communication_edges > 0 else 0.0,
+
+            # -------------------------
+            # Action behavior
+            # -------------------------
+
+            'increase_actions':
+                self.increase_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            'decrease_actions':
+                self.decrease_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            'no_variation_actions':
+                self.no_variation_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            'real_increase_actions':
+                self.real_increase_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            'real_decrease_actions':
+                self.real_decrease_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            'real_no_change_actions':
+                self.real_no_change_actions / total_steps
+                if total_steps > 0 else 0.0,
+
+            # -------------------------
+            # Existing targeting metrics
+            # -------------------------
+
+            'targeted_edges':
+                len(self.targeted_edges) /
+                self.num_communication_edges
+                if self.num_communication_edges > 0 else 0.0,
+
+            'targeted_positive_variations':
+                len(self.targeted_positive_variations) /
+                len([v for v in self.variations if v > 0])
+                if len([v for v in self.variations if v > 0]) > 0
+                else 0.0,
+
+            'targeted_negative_variations':
+                len(self.targeted_negative_variations) /
+                len([v for v in self.variations if v < 0])
+                if len([v for v in self.variations if v < 0]) > 0
+                else 0.0,
         })
 
+    def is_valid_action(self, edge, value):
 
-    def is_valid_action(self, edge, variation):
-        # check that if bounded we don't go out of bounds, and if remove_invalid_actions is true, that we don't return invalid actions
         u, v = self._canon_link(*edge)
-        new_weight = self.communication_graph[u][v]['edge_attr_dict']['weight'] + variation
-        if self.bounded_weights:
-            return self.min_weight <= new_weight <= self.max_weight
-        return new_weight >= 1
+        if not self.revisiting:
+            if (u, v) in self.visited_edges:
+
+                return False
+
+            # value = final weight
+            return (
+                    self.min_weight
+                    <= value
+                    <= self.max_weight
+            )
+
+        else:
+
+            # value = variation
+            new_weight = (
+                    self.communication_graph[u][v]
+                    ['edge_attr_dict']['weight']
+                    + value
+            )
+
+            if self.bounded_weights:
+                return (
+                        self.min_weight
+                        <= new_weight
+                        <= self.max_weight
+                )
+
+            return new_weight >= 1
 
 class ExtendedOSPFTrafficEngineeringEnv(OSPFTrafficEngineeringEnv, ContinuousEnv):
     def __init__(self, **config):
@@ -852,12 +1264,26 @@ class ExtendedOSPFTrafficEngineeringEnv(OSPFTrafficEngineeringEnv, ContinuousEnv
             'traffic_graph_density': Function(func=get_graph_density, graph_name='traffic_graph'),
             'action_space': ActionSpace(poolings=[MeanPooling, SumPooling, MaxPooling, MinPooling])
         }
+        if self.revisiting:
+            action_values = self.variations
+            action_name = "weights_variations"
+        else:
+            action_values = self.final_weights
+            action_name = "final_weights"
+
         self._action_type = {
-            'link': Edge(graph_name='communication_graph', bidirectional=True, poolings=[MeanPooling]),
-            'weight_variation': Object(name='weights_variations', set=self.variations,
-                                       feature_extractor=OneHotEncoding,
-                                       feature_extractor_args={'set': self.variations},
-                                       embedding_size=len(self.variations))
+            'link': Edge(
+                graph_name='communication_graph',
+                bidirectional=True,
+                poolings=[MeanPooling]
+            ),
+            'weight_value': Object(
+                name=action_name,
+                set=action_values,
+                feature_extractor=OneHotEncoding,
+                feature_extractor_args={'set': action_values},
+                embedding_size=len(action_values)
+            )
         }
         if not hasattr(self, 'traffic_sum'):
             self.traffic_sum = sum(
@@ -939,14 +1365,35 @@ class ExtendedOSPFTrafficEngineeringEnv(OSPFTrafficEngineeringEnv, ContinuousEnv
             self.discrete_actions = ["no_action"]
         else:
             self.discrete_actions = []
-        self.action_candidates_reconstruction = False
+        if not self.revisiting:
+            self.action_candidates_reconstruction = True
+        else:
+            self.action_candidates_reconstruction = False
         self.reconstruct_only_changed_nodes = False
         self.action_space_reconstruction_each_step = True
 
     def sample_valid_action(self):
         # 1. Randomly select an edge
-        edge_idx = np.random.randint(0, len(self.communication_edges))
-        edge_source, edge_target = self.communication_edges[edge_idx]
+        if self.revisiting:
+            edge_idx = np.random.randint(0, len(self.communication_edges))
+            edge_source, edge_target = self.communication_edges[edge_idx]
+        else:
+            unvisited_edges = [
+                e for e in self.communication_links
+                if e not in self.visited_edges
+            ]
+
+            if not unvisited_edges:
+                return None
+
+            edge_idx = np.random.randint(0, len(unvisited_edges))
+            edge_source, edge_target = unvisited_edges[edge_idx]
+
+        if not self.revisiting:
+            # 2. Randomly select a final weight for that edge
+            final_weight = np.random.choice(self.final_weights)
+            return ((edge_source, edge_target), final_weight)
+
         # 2. Compute all valid variation values (multiples of action_distance)
         variation_values = []
         for variation in self.variations:
