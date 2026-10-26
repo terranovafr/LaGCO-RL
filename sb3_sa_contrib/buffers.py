@@ -12,7 +12,7 @@
 # Modification: Added next_action_set storage and sampling to DictReplayBuffer.
 # This allows storing the set of valid next actions for each transition, which is useful for algorithms that need to consider action masking or have a variable action space.
 
-from typing import Any, NamedTuple, Dict
+from typing import Any, NamedTuple, Dict, Optional
 from stable_baselines3.common.vec_env import VecNormalize
 import numpy as np
 import torch as th
@@ -25,7 +25,7 @@ class DictReplayBufferSamplesStateAction(NamedTuple):
     next_actions: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
-    discounts: th.Tensor | None = None
+    discounts: Optional[th.Tensor] = None
 
 class DictReplayBufferWithNextActions(DictReplayBuffer):
     """
@@ -54,7 +54,7 @@ class DictReplayBufferWithNextActions(DictReplayBuffer):
             # Store array directly in the list
             self.next_action_set[self.pos - 1] = next_action_set.copy()
 
-    def _get_samples(self, batch_inds: np.ndarray, env: VecNormalize | None = None) -> DictReplayBufferSamplesStateAction:
+    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> DictReplayBufferSamplesStateAction:
         """
         Sample batch and return DictReplayBufferSamplesStateAction including next_actions.
         """

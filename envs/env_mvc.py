@@ -417,6 +417,14 @@ class MVCEnv(DiscreteEnv):
             "edge_efficiency": edge_efficiency
         })
 
+    def sample_valid_action(self):
+        if self.revisiting:
+            return random.randrange(self.num_nodes)
+        else:
+            nodes_set = [n for n in range(self.num_nodes) if self.graph.nodes[n]['x_dict']['selected'] == 0]
+            return random.choice(nodes_set)
+
+
 class ExtendedMVCEnv(MVCEnv, ContinuousEnv):
     def __init__(self, **config):
         super().__init__(**config)

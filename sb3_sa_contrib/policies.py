@@ -10,7 +10,7 @@
 # Licensed under the MIT License
 
 # Modification: Added StateActionQNetwork and StateActionDQNPolicy to implement a DQN variant that takes both state and action as input to the Q-network. This allows for more flexible action representations, such as continuous actions or action sets, rather than just discrete action indices, and support variable action sets.
-
+from typing import Union, Optional, Tuple, Dict
 import torch.nn as nn
 from gymnasium.spaces import Box
 import numpy as np
@@ -21,6 +21,7 @@ from stable_baselines3.common.type_aliases import PyTorchObs
 from stable_baselines3.common.torch_layers import create_mlp
 from stable_baselines3.dqn.policies import QNetwork
 import torch
+from typing import Union
 
 def _dict_to_tensor(observation):
     # Convert each tensor in the dict to 1D and concatenate
@@ -150,12 +151,12 @@ class StateActionDQNPolicy(DQNPolicy):
 
     def predict(
             self,
-            observation: np.ndarray | dict[str, np.ndarray],
-            state: tuple[np.ndarray, ...] | None = None,
-            episode_start: np.ndarray | None = None,
+            observation: Union[np.ndarray, Dict[str, np.ndarray]],
+            state: Optional[Tuple[np.ndarray, ...]] = None,
+            episode_start: Optional[np.ndarray] = None,
             deterministic: bool = False,
             no_exploration: bool = False,
-    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         self.set_training_mode(False)
         if isinstance(observation, tuple) and len(observation) == 2 and isinstance(observation[1], dict):
             raise ValueError(

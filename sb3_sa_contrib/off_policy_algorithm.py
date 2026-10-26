@@ -13,7 +13,7 @@
 
 import random
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any, Optional, Union
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.type_aliases import RolloutReturn, TrainFreq, TrainFrequencyUnit
@@ -110,7 +110,7 @@ class OffPolicyAlgorithmStateAction(OffPolicyAlgorithm):
             self,
             replay_buffer: DictReplayBufferWithNextActions,
             buffer_action: np.ndarray,
-            new_obs: np.ndarray | dict[str, np.ndarray],
+            new_obs: Union[np.ndarray, dict[str, np.ndarray]],
             new_action_set: np.ndarray,
             reward: np.ndarray,
             dones: np.ndarray,

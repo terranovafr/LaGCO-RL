@@ -276,3 +276,9 @@ class GAETrainingWrapper(GraphWrapper):
             graph, _, _ = self.attribute_encoding(graph, graph_name)
             new_graphs[graph_name] = graph
         return new_graphs
+
+    def get_metrics(self):
+        return self.env.get_metrics()
+
+    def update_metrics(self):
+        self.env.update_metrics()

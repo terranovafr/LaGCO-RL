@@ -13,7 +13,7 @@
 
 import random
 import warnings
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import numpy as np
 import torch as th
 from gymnasium import spaces
@@ -32,7 +32,7 @@ class iDQN(OffPolicyAlgorithmStateAction):
     Check the original DQN implementation for more details: https://stable-baselines3.readthedocs.io/en/master/modules/dqn.html
     """
 
-    policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
+    policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
         "MlpPolicy": MlpPolicy,
         "CnnPolicy": CnnPolicy,
         "MultiInputPolicy": MultiInputPolicy,
@@ -46,18 +46,18 @@ class iDQN(OffPolicyAlgorithmStateAction):
 
     def __init__(
         self,
-        policy: str | type[DQNPolicy],
-        env: GymEnv | str,
-        learning_rate: float | Schedule = 1e-4,
+        policy: Union[str, Type[DQNPolicy]],
+        env: Union[GymEnv, str],
+        learning_rate: Union[float, Schedule] = 1e-4,
         buffer_size: int = 1_000_000,
         learning_starts: int = 100,
         batch_size: int = 32,
         tau: float = 1.0,
         gamma: float = 0.99,
-        train_freq: int | tuple[int, str] = 4,
+        train_freq: Union[int, Tuple[int, str]] = 4,
         gradient_steps: int = 1,
-        replay_buffer_class: type[ReplayBuffer] | None = None,
-        replay_buffer_kwargs: dict[str, Any] | None = None,
+        replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
+        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
         n_steps: int = 1,
         target_update_interval: int = 10000,
@@ -66,11 +66,11 @@ class iDQN(OffPolicyAlgorithmStateAction):
         exploration_final_eps: float = 0.05,
         max_grad_norm: float = 10,
         stats_window_size: int = 100,
-        tensorboard_log: str | None = None,
-        policy_kwargs: dict[str, Any] | None = None,
+        tensorboard_log: Optional[str] = None,
+        policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
-        seed: int | None = None,
-        device: th.device | str = "auto",
+        seed: Optional[int] = None,
+        device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ) -> None:
         super().__init__(
@@ -209,12 +209,12 @@ class iDQN(OffPolicyAlgorithmStateAction):
 
     def predict(
         self,
-        observation: np.ndarray | dict[str, np.ndarray],
-        state: tuple[np.ndarray, ...] | None = None,
-        episode_start: np.ndarray | None = None,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
         no_exploration: bool = False,
-    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         # Get candidate actions from the environment for the current observation
         candidate_actions = self.env.envs[0].get_candidate_action_KNNs()
         if not no_exploration and not deterministic and np.random.rand() < self.exploration_rate:
@@ -259,10 +259,10 @@ class iDQN(OffPolicyAlgorithmStateAction):
             progress_bar=progress_bar,
         )
 
-    def _excluded_save_params(self) -> list[str]:
+    def _excluded_save_params(self) -> List[str]:
         return [*super()._excluded_save_params(), "q_net", "q_net_target"]
 
-    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
+    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "policy.optimizer"]
 
         return state_dicts, []

@@ -59,7 +59,7 @@ class AgentTrainingWrapper(GraphWrapper):
                  protoknn_heuristic: [Union[dict, float], str, None] = None,
                  pca_percentage_target=1,
                  pca_minimum_without_loss=False,
-                 remove_non_valid_actions=False,
+                 remove_invalid_actions=False,
                  projection_agent=None,
                  sample_subset_actions=100,
                  sample_subset_actions_strategy="random",  # "random" or "farthest"
@@ -107,7 +107,7 @@ class AgentTrainingWrapper(GraphWrapper):
         self.last_knn_candidates = None  # np.array of shape [K, proto_dim]
         self.last_selected_knn_index = None  # int
         self.local_num_iterations = 0
-        self.remove_non_valid_actions = remove_non_valid_actions
+        self.remove_invalid_actions = remove_invalid_actions
         self.plot_action_space = plot_action_space
         self.plot_action_space_interval = plot_action_space_interval
         self.epsilon_lower = epsilon_lower
@@ -144,7 +144,15 @@ class AgentTrainingWrapper(GraphWrapper):
         elif self.vgae_projection == "distribution" and self.gae_model_type == 'vgae':
             self.norm_action_space = False
             self.distance_computation = 'cpu'
-
+        self.action_candidates_reconstruction = getattr(
+            env, "action_candidates_reconstruction", True
+        )
+        self.action_space_reconstruction_each_step = getattr(
+            env, "action_space_reconstruction_each_step", True
+        )
+        self.reconstruct_only_changed_nodes = getattr(
+            env, "reconstruct_only_changed_nodes", False
+        )
         Gs = self.env.get_graphs()
         encoded_Gs = {}
         for G_name in Gs:
@@ -1698,10 +1706,14 @@ class AgentTrainingWrapper(GraphWrapper):
             cmp_at_k_stats = {}
             cmp_at_k_dict = {}
             for cmp_at_k in cmp_at_k_collection:
+                if cmp_at_k is None:
+                    continue
                 for k, v in cmp_at_k.items():
                     if k not in cmp_at_k_dict:
                         cmp_at_k_dict[k] = []
                     cmp_at_k_dict[k].append(v)
+            if not cmp_at_k_dict:
+                return
             for k in cmp_at_k_dict:
                 cmp_at_k_stats[k] = {}
                 cmp_at_k_stats[k]['mean'] = np.mean(cmp_at_k_dict[k])
@@ -1836,18 +1848,50 @@ class AgentTrainingWrapper(GraphWrapper):
                 assert len(action_vector) == len(self.action_upper_bounds), \
                     f"Action vector dimensionality {len(action_vector)} does not match action space upper bounds dimensionality {len(self.action_upper_bounds)}."
                 # assert with small tolerance
+
                 if self.algorithm_type == "iterative":
-                    key = tuple(np.round(action_vector, 6))
-                    selected_action = self.action_set_reversed.get(key)
+                    # 1. Convert the policy output into a vector.
+                    action_vector = np.asarray(action_vector, dtype=np.float32).reshape(-1)
+
+                    # 2. Get the available discrete actions and their vectors.
+                    if not self.action_set:
+                        raise RuntimeError("The action set is empty.")
+
+                    action_ids = list(self.action_set.keys())
+                    action_vectors = np.asarray(
+                        [self.action_set[action_id] for action_id in action_ids],
+                        dtype=np.float32,
+                    )
+
+                    # 3. Check that the dimensions agree.
+                    if action_vectors.ndim != 2:
+                        raise RuntimeError(
+                            f"Expected 2D action vectors, got shape {action_vectors.shape}"
+                        )
+
+                    if action_vector.size != action_vectors.shape[1]:
+                        raise ValueError(
+                            f"Policy output has {action_vector.size} dimensions; "
+                            f"action vectors have {action_vectors.shape[1]} dimensions."
+                        )
+
+                    # 4. Find the closest available action.
+                    distances = np.linalg.norm(
+                        action_vectors - action_vector[None, :],
+                        axis=1,
+                    )
+                    best_idx = int(np.argmin(distances))
+                    selected_action = action_ids[best_idx]
+
+                    # 5. Convert the selected action ID into environment arguments.
                     real_action = ()
                     for component in selected_action:
                         values = component[1:]
                         if len(values) == 1:
-                            # Single element — append it directly as (value,)
                             real_action += (values[0],)
                         else:
-                            # Multiple elements — append the tuple
                             real_action += (values,)
+
                 else:
                     real_action, _ = self.map_action(action_vector)
         else:
@@ -1878,8 +1922,15 @@ class AgentTrainingWrapper(GraphWrapper):
             graph_changed = 0
 
         if (graph_changed or self.action_space_reconstruction_each_step) and (self.algorithm_type == "projection" or self.algorithm_type == "iterative"):
-            self.action_set, _, _ = self.create_continuous_action_space(encoded_Gs, changed_nodes_Gs)
-            self.perform_pca_reduction()
+            if (
+                    (graph_changed or self.action_space_reconstruction_each_step)
+                    and (self.algorithm_type == "projection"
+                         or self.algorithm_type == "iterative")
+            ):
+                self.action_set, _, _ = self.create_continuous_action_space(
+                    encoded_Gs, changed_nodes_Gs
+                )
+                self.perform_pca_reduction()
             if len(self.action_set) > 0 and (self.algorithm_type == "projection" or self.projection_agent) and self.distance_computation == 'faiss':
                 self.rebuild_index()
         if done or truncated:
@@ -1986,12 +2037,12 @@ class AgentTrainingWrapper(GraphWrapper):
         self.terminate_at_approximate_best = terminate
 
     def get_candidate_action_KNNs(self):
-        # Retrieve the stored KNN candidates for the last mapped action, or return all action vectors in the action set if no candidates are stored.
         if self.candidate_action_KNNs is not None:
-            return self.candidate_action_KNNs
-        else:
-            # return all action vectors in the action set
-            return np.array(list(self.action_set.values())).astype('float32')
+            return np.asarray(self.candidate_action_KNNs, dtype=np.float32)
+        return np.asarray(
+            list(self.action_set.values()),
+            dtype=np.float32,
+        )
 
     def restrict_action_space(self):
         candidate_action = self.projection_agent.predict(self.observation, deterministic=False)
@@ -2051,3 +2102,7 @@ class AgentTrainingWrapper(GraphWrapper):
             return indices[best_idx]
 
         return indices[chosen]
+
+    def get_metrics(self):
+        return self.env.get_metrics()
+

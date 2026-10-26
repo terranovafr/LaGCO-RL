@@ -327,7 +327,10 @@ class GraphEnvSwitcher(gym.Env):
             env.set_knn(self.knn)
         if self.proto_knn is not None and isinstance(env, GraphWrapper):
             env.set_proto_knn_influence(self.proto_knn)
-        env.set_terminate_at_approximate_best(self.terminate_at_approximate_best)
+        if hasattr(env, 'set_terminate_at_approximate_best'):
+            env.set_terminate_at_approximate_best(
+                self.terminate_at_approximate_best
+            )
         if (self.algorithm_type == "projection" or self.algorithm_type == "iterative") and self.continuous_features_loaded:
             if hasattr(self, 'discrete_actions'):
                 env.set_discrete_actions(self.discrete_actions)

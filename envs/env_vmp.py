@@ -6,11 +6,13 @@
 
 
 import copy
+from typing import Optional
 import networkx as nx
 from gymnasium.spaces import Box, Dict
 from tqdm import tqdm
 import numpy as np
 import random
+import matplotlib.pyplot as plt
 from utils.features_utils import get_number_nodes, get_number_edges, get_average_node_degree, get_graph_density
 from utils.model import Node, Graph, Attribute, ActionSpace, Function
 from utils.feature_extractors import OneHotEncoding
@@ -71,6 +73,10 @@ class VMPlacementEnv(DiscreteEnv):
             max_sweeps: int = 2500,
             invalid_action_penalty_sum: float = -10,
             revisiting: bool = False,
+            alloc_graph: Optional[nx.Graph] = None,
+            traffic_graph: Optional[nx.Graph] = None,
+            latency_graph: Optional[nx.Graph] = None,
+            scenario_graphs: Optional[dict] = None,
             **kwargs
     ):
         super().pre_init(**kwargs)
@@ -95,6 +101,18 @@ class VMPlacementEnv(DiscreteEnv):
         self.max_sweeps = max_sweeps
         self.invalid_action_penalty_sum = invalid_action_penalty_sum
         self.revisiting = revisiting
+        supplied_graphs = (alloc_graph is not None, traffic_graph is not None, latency_graph is not None)
+        if any(supplied_graphs) and not all(supplied_graphs):
+            raise ValueError("Provide all three graphs: alloc_graph, traffic_graph, and latency_graph.")
+        if all(supplied_graphs):
+            if scenario_graphs is not None:
+                raise ValueError("Use either the three graph arguments or scenario_graphs, not both.")
+            scenario_graphs = {
+                "alloc_graph": alloc_graph,
+                "traffic_graph": traffic_graph,
+                "latency_graph": latency_graph,
+            }
+        self.scenario_graphs = scenario_graphs
 
         self.pm_capacity_ranges = {
             "pe": (pm_capacity_pe_min, pm_capacity_pe_max),
@@ -139,16 +157,39 @@ class VMPlacementEnv(DiscreteEnv):
             )
         })
 
-        success = False
-        attempts = 0
-        while not success:
-            # Initialize datacenter, VMs, and allocations
-            self._generate_datacenter()
-            self._generate_vms()
-            success = self._initialize_empirical_worst_allocation(max_sweeps=self.max_sweeps)
-            attempts += 1
-            if attempts >= 5 and not success:
-                raise ValueError("Failed to initialize empirical worst allocation after 5 attempts.")
+        # Either generate a random scenario or load the three supplied graphs.
+        if self.scenario_graphs is None:
+            success = False
+            attempts = 0
+            while not success:
+                self._generate_datacenter()
+                self._generate_vms()
+                success = self._initialize_empirical_worst_allocation(
+                    max_sweeps=self.max_sweeps
+                )
+                attempts += 1
+                if attempts >= 5 and not success:
+                    raise ValueError(
+                        "Failed to initialize empirical worst allocation after 5 attempts."
+                    )
+        else:
+            self._load_scenario_graphs(self.scenario_graphs)
+            success = self._initialize_empirical_worst_allocation(
+                max_sweeps=self.max_sweeps
+            )
+            if not success:
+                raise ValueError(
+                    "Could not initialize a feasible allocation from scenario_graphs. "
+                    "Check PM capacities, VM demands, and graph attributes."
+                )
+
+        # Graph-based scenarios may have different sizes than the default parameters.
+        self.pm_feat_dim = 8
+        self.vm_feat_dim = 7
+        self.obs_dim = self.n_pms * self.pm_feat_dim + self.n_vms * self.vm_feat_dim
+        self.observation_space = Dict({
+            "graph": Box(low=0, high=1, shape=(self.obs_dim,), dtype=np.float32)
+        })
 
         # update graphs
         for vm_id in range(self.n_vms):
@@ -169,6 +210,241 @@ class VMPlacementEnv(DiscreteEnv):
         self.scenario_size = self.n_pms + self.n_vms
         self.reset()
         super().post_init()
+
+    @staticmethod
+    def _edge_value(data, key, default=None):
+        """Read an edge value from either a direct attribute or edge_attr_dict."""
+        if key in data:
+            return data[key]
+        return data.get("edge_attr_dict", {}).get(key, default)
+
+    def _load_scenario_graphs(self, scenario_graphs):
+        """Load canonical alloc/traffic/latency NetworkX graphs.
+
+        Required node labels are VM_0..VM_n and PM_0..PM_n. Node data must
+        contain x_dict attributes in the same schema used by this environment.
+        Traffic edges require traffic weights; latency edges require latency
+        weights. The latency graph must connect all PMs.
+        """
+        required = {"alloc_graph", "traffic_graph", "latency_graph"}
+        if not isinstance(scenario_graphs, dict) or not required.issubset(scenario_graphs):
+            raise ValueError(
+                "scenario_graphs must be a dict containing alloc_graph, "
+                "traffic_graph, and latency_graph."
+            )
+        for name in required:
+            graph = scenario_graphs[name]
+            if not isinstance(graph, nx.Graph):
+                raise TypeError(f"scenario_graphs['{name}'] must be a NetworkX graph.")
+
+        self.alloc_graph = copy.deepcopy(scenario_graphs["alloc_graph"])
+        self.traffic_graph = copy.deepcopy(scenario_graphs["traffic_graph"])
+        self.latency_graph = copy.deepcopy(scenario_graphs["latency_graph"])
+
+        pms = sorted(
+            [n for n, d in self.alloc_graph.nodes(data=True)
+             if d.get("x_dict", {}).get("type") == "PM"],
+            key=lambda x: int(str(x).split("_")[-1]) if str(x).split("_")[-1].isdigit() else str(x),
+        )
+        vms = sorted(
+            [n for n, d in self.alloc_graph.nodes(data=True)
+             if d.get("x_dict", {}).get("type") == "VM"],
+            key=lambda x: int(str(x).split("_")[-1]) if str(x).split("_")[-1].isdigit() else str(x),
+        )
+        expected_pms = [f"PM_{i}" for i in range(len(pms))]
+        expected_vms = [f"VM_{i}" for i in range(len(vms))]
+        if pms != expected_pms or vms != expected_vms:
+            raise ValueError(
+                "Allocation graph nodes must use contiguous labels PM_0..PM_n and VM_0..VM_n, "
+                "with x_dict['type'] set to 'PM' or 'VM'."
+            )
+        self.n_pms, self.n_vms = len(pms), len(vms)
+        if self.n_pms < 2 or self.n_vms < 2:
+            raise ValueError("A scenario needs at least two PMs and two VMs.")
+
+        # Validate and infer resource ranges from supplied attributes.
+        for pm in pms:
+            info = self.alloc_graph.nodes[pm].get("x_dict", {})
+            for key in ("cap", "used", "escape_prob"):
+                if key not in info:
+                    raise ValueError(f"{pm} is missing x_dict[{key!r}].")
+            for resource in ("pe", "mips", "ram", "storage"):
+                if resource not in info["cap"]:
+                    raise ValueError(f"{pm} capacity is missing resource {resource!r}.")
+        for vm in vms:
+            info = self.alloc_graph.nodes[vm].get("x_dict", {})
+            for key in ("dem", "tenant", "vuln_prob"):
+                if key not in info:
+                    raise ValueError(f"{vm} is missing x_dict[{key!r}].")
+            for resource in ("pe", "mips", "ram", "storage"):
+                if resource not in info["dem"]:
+                    raise ValueError(f"{vm} demand is missing resource {resource!r}.")
+
+        resources = ("pe", "mips", "ram", "storage")
+        self.pm_capacity_ranges = {
+            r: (min(self.alloc_graph.nodes[p]["x_dict"]["cap"][r] for p in pms),
+                max(self.alloc_graph.nodes[p]["x_dict"]["cap"][r] for p in pms))
+            for r in resources
+        }
+        self.vm_demand_ranges = {
+            r: (min(self.alloc_graph.nodes[v]["x_dict"]["dem"][r] for v in vms),
+                max(self.alloc_graph.nodes[v]["x_dict"]["dem"][r] for v in vms))
+            for r in resources
+        }
+        # Avoid division by zero in feature normalization for constant-valued resources.
+        for ranges in (self.pm_capacity_ranges, self.vm_demand_ranges):
+            for resource, (lo, hi) in list(ranges.items()):
+                if hi == lo:
+                    ranges[resource] = (lo - 0.5, hi + 0.5)
+        tenants = [self.alloc_graph.nodes[v]["x_dict"]["tenant"] for v in vms]
+        self.n_tenants = max(tenants, default=0) + 1
+        self.vm_vuln_prob_min = min(self.alloc_graph.nodes[v]["x_dict"]["vuln_prob"] for v in vms)
+        self.vm_vuln_prob_max = max(self.alloc_graph.nodes[v]["x_dict"]["vuln_prob"] for v in vms)
+        self.pm_escape_prob_min = min(self.alloc_graph.nodes[p]["x_dict"]["escape_prob"] for p in pms)
+        self.pm_escape_prob_max = max(self.alloc_graph.nodes[p]["x_dict"]["escape_prob"] for p in pms)
+
+        # Ensure the two static graphs have the expected VM/PM nodes and features.
+        if set(self.traffic_graph.nodes) != set(vms):
+            raise ValueError("traffic_graph must contain exactly the VM nodes in alloc_graph.")
+        if set(self.latency_graph.nodes) != set(pms):
+            raise ValueError("latency_graph must contain exactly the PM nodes in alloc_graph.")
+        for vm in vms:
+            self.traffic_graph.nodes[vm].setdefault("x_dict", {})
+            self.traffic_graph.nodes[vm]["x_dict"].update(
+                copy.deepcopy(self.alloc_graph.nodes[vm]["x_dict"])
+            )
+        for pm in pms:
+            self.latency_graph.nodes[pm].setdefault("x_dict", {})
+            self.latency_graph.nodes[pm]["x_dict"].update(
+                copy.deepcopy(self.alloc_graph.nodes[pm]["x_dict"])
+            )
+
+        for u, v, data in self.traffic_graph.edges(data=True):
+            if self._edge_value(data, "traffic") is None:
+                raise ValueError(f"Traffic edge ({u}, {v}) has no traffic weight.")
+        for u, v, data in self.latency_graph.edges(data=True):
+            latency = self._edge_value(data, "latency")
+            if latency is None or float(latency) < 0:
+                raise ValueError(f"Latency edge ({u}, {v}) needs a non-negative latency weight.")
+            data["weight"] = float(latency)
+        if not nx.is_connected(self.latency_graph):
+            raise ValueError("latency_graph must be connected so every PM pair has a path.")
+
+        self.latency_min = min((self._edge_value(d, "latency") for _, _, d in self.latency_graph.edges(data=True)), default=1.0)
+        self.latency_max = max((self._edge_value(d, "latency") for _, _, d in self.latency_graph.edges(data=True)), default=20.0)
+        self.min_traffic = min((self._edge_value(d, "traffic") for _, _, d in self.traffic_graph.edges(data=True)), default=1.0)
+        self.max_traffic = max((self._edge_value(d, "traffic") for _, _, d in self.traffic_graph.edges(data=True)), default=10.0)
+        self.p_idle = float(np.mean([self.alloc_graph.nodes[p]["x_dict"].get("power", 60.0) for p in pms]))
+        self.p_peak = max(self.p_idle + 1.0, float(self.p_peak))
+        self.latency_dict = {u: dict(row) for u, row in nx.floyd_warshall(self.latency_graph, weight="weight").items()}
+        self.max_latency_movement_cost = max(
+            (self.latency_dict[u][v] for u in pms for v in pms if u != v),
+            default=1.0,
+        )
+
+        # Initialize usage and power from the supplied capacity/demand data;
+        # the empirical initializer will construct a feasible allocation.
+        for pm in pms:
+            self.alloc_graph.nodes[pm]["x_dict"]["used"] = {r: 0 for r in resources}
+            self.alloc_graph.nodes[pm]["x_dict"]["power"] = self.p_idle
+        self.alloc_graph.remove_edges_from(list(self.alloc_graph.edges()))
+        self.initial_alloc_graph = copy.deepcopy(self.alloc_graph)
+
+    def _record_metrics_history(self):
+        """Append a numeric snapshot of objectives and reward for plotting."""
+        if not hasattr(self, "metrics_history"):
+            self.metrics_history = []
+        row = {"step": int(getattr(self, "current_step", getattr(self, "steps", 0))),
+               "reward": float(getattr(self, "reward", 0.0))}
+        for key, value in getattr(self, "current_metrics", {}).items():
+            if np.isscalar(value):
+                try:
+                    row[key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        self.metrics_history.append(row)
+
+    def render(self, show=True, save_path=None):
+        """Render VM allocation and objective history."""
+        fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+        axes = axes.flatten()
+
+        # 1) Current VM allocation.
+        graph = self.alloc_graph
+        pos = nx.spring_layout(graph, seed=7)
+
+        pm_nodes = [
+            n for n, d in graph.nodes(data=True)
+            if d.get("x_dict", {}).get("type") == "PM"
+        ]
+        vm_nodes = [
+            n for n, d in graph.nodes(data=True)
+            if d.get("x_dict", {}).get("type") == "VM"
+        ]
+
+        nx.draw_networkx_edges(
+            graph, pos, ax=axes[0], edge_color="#BBBBBB", width=1
+        )
+        nx.draw_networkx_nodes(
+            graph, pos, nodelist=pm_nodes, node_color="#4C78A8",
+            node_shape="s", node_size=250, ax=axes[0], label="PM"
+        )
+        nx.draw_networkx_nodes(
+            graph, pos, nodelist=vm_nodes, node_color="#F58518",
+            node_size=100, ax=axes[0], label="VM"
+        )
+
+        if graph.number_of_nodes() <= 35:
+            nx.draw_networkx_labels(graph, pos, ax=axes[0], font_size=6)
+
+        axes[0].set_title("VM allocation")
+        axes[0].axis("off")
+        axes[0].legend(fontsize=7, loc="best")
+
+        # 2) Objective and reward history.
+        history = getattr(self, "metrics_history", [])
+
+        plots = [
+            ("avg_util", "Average utilization"),
+            ("packing_efficiency", "Packing efficiency"),
+            ("avg_power", "Average power"),
+            ("avg_load", "Communication load"),
+            ("avg_security_risk", "Security risk"),
+            ("weighted_sum", "Weighted objective"),
+            ("reward", "Reward per step"),
+        ]
+
+        for ax, (key, title) in zip(axes[1:], plots):
+            rows = [r for r in history if key in r]
+
+            if rows:
+                xs = [r["step"] for r in rows]
+                ys = [r[key] for r in rows]
+                ax.plot(xs, ys, linewidth=1.5)
+                ax.scatter(xs, ys, s=9)
+
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("Step", fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.25)
+
+        fig.suptitle(
+            f"VM Placement — step "
+            f"{getattr(self, 'current_step', getattr(self, 'steps', 0))}"
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if save_path is not None:
+            from pathlib import Path
+            path = Path(save_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+
+        if show:
+            plt.show(block=False)
+            plt.pause(0.001)
+
+        return fig
 
     def build_action_list(self):
         action_list = []
@@ -242,7 +518,9 @@ class VMPlacementEnv(DiscreteEnv):
                 if not mst.has_edge(i, j) and random.random() < extra_edge_prob:
                     G.add_edge(f"PM_{i}", f"PM_{j}", edge_attr_dict={"latency": lat_matrix[i, j]})
 
-        fw = nx.floyd_warshall(G, weight="latency")
+        for _, _, data in G.edges(data=True):
+            data["weight"] = data["edge_attr_dict"]["latency"]
+        fw = nx.floyd_warshall(G, weight="weight")
         latency_dict = {u: dict(v) for u, v in fw.items()}
         self.max_latency_movement_cost = max(
             latency_dict[u][v] for u in latency_dict for v in latency_dict[u] if u != v)
@@ -365,7 +643,7 @@ class VMPlacementEnv(DiscreteEnv):
 
             traffic_score = 0.0
             for nbr in self.traffic_graph.neighbors(vm_name):
-                traffic_score += self.traffic_graph[vm_name][nbr]["edge_attr_dict"]["traffic"]
+                traffic_score += self._edge_value(self.traffic_graph[vm_name][nbr], "traffic", 0.0)
 
             return demand_score + 0.25 * traffic_score
 
@@ -658,7 +936,7 @@ class VMPlacementEnv(DiscreteEnv):
     def _vm_features(self, idx):
         info = self.alloc_graph.nodes[idx]["x_dict"]
         dem = info["dem"]
-        total_traffic = sum(self.traffic_graph[idx][nbr]["edge_attr_dict"]["traffic"]
+        total_traffic = sum(self._edge_value(self.traffic_graph[idx][nbr], "traffic", 0.0)
                             for nbr in self.traffic_graph.neighbors(idx))
         pm_self = self._get_pm_of_vm(idx)
         colocated_ratio = sum(1 for nbr in self.alloc_graph.neighbors(idx)
@@ -849,6 +1127,7 @@ class VMPlacementEnv(DiscreteEnv):
         self.action = (vm_idx, pm_idx)
 
         super().post_step()
+        self._record_metrics_history()
 
         return (
             self.obs,
@@ -1003,6 +1282,7 @@ class VMPlacementEnv(DiscreteEnv):
         self.action = (vm_idx, pm_idx)
 
         super().post_step()
+        self._record_metrics_history()
 
         return (
             self.obs,
@@ -1036,6 +1316,9 @@ class VMPlacementEnv(DiscreteEnv):
 
         self.previous_metrics = self._initial_metrics.copy()
         self.current_metrics = self._initial_metrics.copy()
+        self.metrics_history = []
+        self.reward = 0.0
+        self._record_metrics_history()
 
         # Every VM is initially available to be moved once
         self.action_list = self.build_action_list()
@@ -1059,7 +1342,7 @@ class VMPlacementEnv(DiscreteEnv):
         placement gets stuck.
         """
 
-        for attempt in range(max_attempts):
+        for _ in range(max_attempts):
 
             # Reset PM usage
             for pm_idx in range(self.n_pms):
@@ -1143,6 +1426,9 @@ class VMPlacementEnv(DiscreteEnv):
 
         self.previous_metrics = self._initial_metrics.copy()
         self.current_metrics = self._initial_metrics.copy()
+        self.metrics_history = []
+        self.reward = 0.0
+        self._record_metrics_history()
 
         # ------------------------------------------------------------
         # Best solution at beginning of episode
@@ -1240,7 +1526,7 @@ class VMPlacementEnv(DiscreteEnv):
                 pm1 = self._get_pm_of_vm(vm)
                 pm2 = self._get_pm_of_vm(nbr)
 
-                traffic = self.traffic_graph[vm][nbr]["edge_attr_dict"]["traffic"]
+                traffic = self._edge_value(self.traffic_graph[vm][nbr], "traffic", 0.0)
                 if pm1 != pm2:
                     lat = self.latency_dict[pm1][pm2]
                     tenant_latencies[tenant].append(lat * traffic)

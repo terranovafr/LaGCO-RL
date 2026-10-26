@@ -3,14 +3,13 @@
 # This file is licensed under the GNU General Public License v3.0.
 # You may redistribute it and/or modify it under the terms of the GPL-3.0.
 # See the LICENSE file in the project root for the full license text.
-
+from __future__ import annotations
 from typing import Any
 import time
 import gymnasium as gym
 import numpy as np
 from gymnasium.core import ObsType
 from gymnasium.spaces import Discrete
-
 
 # DiscreteEnv class defining only the common logic for discrete action spaces, the specific environment should inherit from this class and implement the environment-specific logic, such as defining the action list, observation space, reward calculation, and done condition.
 # This class also provides common features such as no-op action support, invalid action penalty, action masking, and logging.
@@ -88,7 +87,6 @@ class DiscreteEnv(gym.Env):
         action = tuple(a for a in action if a is not None)
         decoded_action = None
         action_set = self.semantic_action_list if self.semantic_ordering else self.action_list
-
         if len(action) == 0:
             self.invalid_action = True
 
@@ -97,6 +95,8 @@ class DiscreteEnv(gym.Env):
 
         elif len(action) == 1:
             idx = action[0]
+            if isinstance(idx, np.ndarray):
+                idx = idx.item()  # convert numpy array to scalar
             if not isinstance(idx, int) and not isinstance(idx, np.integer) and not (isinstance(idx, float) and idx.is_integer()):
                 self.invalid_action = True
             elif 0 <= idx < len(action_set):
