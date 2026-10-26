@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
-
 """
     loss_fns.py
     This file contains the loss functions used for training the GAE. The main loss is the contrastive adjacency loss, which encourages the model to learn embeddings that can distinguish between connected and non-connected nodes. Additionally, a ranking loss is implemented to ensure that the model learns to rank node pairs correctly based on their true relationships. Finally, linear and squared loss functions are provided to combine multiple loss components with configurable weights.

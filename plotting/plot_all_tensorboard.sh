@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
-# See the LICENSE file in the project root for the full license text.
 #!/bin/bash
 
 ENVS=("maxcut" "mvc" "ospf_engineering" "traffic_engineering" "vmp")

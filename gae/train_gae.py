@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
-
 """
     train_gae.py
     Script to train a Graph Autoencoder (GAE) on a set of environments, with support for multiple graph types, dynamic loss weighting, and validation. The script loads environments, initializes models based on the graph structures, and performs training while periodically evaluating on a validation set. Compression ratios are computed against random initialization baselines to assess the effectiveness of the training.

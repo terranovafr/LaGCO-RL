@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
-
 '''
     agent_training_wrapper.py
     Wrapper that encodes the graph using a GNN and defines a continuous action space based on the action types defined in the environment.
@@ -1660,13 +1659,6 @@ class AgentTrainingWrapper(GraphWrapper):
 
     def reset(self, **kwargs):
         # Call reset function of the environemnt and handle additional logic such as encoding the initial observation and creating the action space
-        print("Times:")
-        print(f"  Observation space creation: {self.observation_space_creation_time:.4f} seconds")
-        print(f"  Action space creation: {self.action_space_creation_time:.4f} seconds")
-        print(f"  Action set construction: {self.action_set_construction_time:.4f} seconds")
-        print(f"  Attribute encoding: {self.attribute_encoding_time:.4f} seconds")
-        print(f"  Graph encoding: {self.graph_encoding_time:.4f} seconds")
-        print(f"  Action mapping: {self.action_mapping_time:.4f} seconds")
         self.action_mapping_time = 0  # Reset for next episode
         self.attribute_encoding_time = 0  # Reset for next episode
         self.graph_encoding_time = 0  # Reset for next episode

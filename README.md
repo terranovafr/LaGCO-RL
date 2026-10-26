@@ -239,8 +239,8 @@ If you use this code in your research, please cite the following paper:
 }
 ```
 
-## GPL-3.0 LICENSE
-The code in this repository is available under the GPL-3.0 License, see the LICENSE file for more information.
+## AGPL-3.0 LICENSE
+The code in this repository is available under the AGPL-3.0 License, see the LICENSE file for more information.
 
 ## Acknowledgments
 

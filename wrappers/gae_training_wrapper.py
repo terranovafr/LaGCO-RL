@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
-
 '''
     gae_training_wrapper.py
     Wrapper that supports the Graph Autoencoder (GAE) training by extracting and encoding node and edge features from the environment's graphs.
@@ -78,8 +77,6 @@ class GAETrainingWrapper(GraphWrapper):
         self.edge_multi_class_info_order[graph_name] = edge_info["multi_class_info_order"]
         self.edge_ranking_indices[graph_name] = edge_info["ranking_indices"]
         self.edge_feature_vector_size[graph_name] = edge_info["feature_vector_size"]
-
-        self._print_graph_info()
 
     def _initialize_graph_containers(self, graph_name):
         self.binary_indices.setdefault(graph_name, [])

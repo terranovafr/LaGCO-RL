@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
 
+'''
+    env_vmp.py
+    This module defines the VMPlacementEnv class, which is a reinforcement learning environment for placing Virtual Machines (VMs) onto Physical Machines (PMs) to optimize several indicators. The environment is built using the Gymnasium framework and utilizes NetworkX for graph representation of the allocation, traffic, and latency graphs.
+'''
 
 import copy
 from typing import Optional

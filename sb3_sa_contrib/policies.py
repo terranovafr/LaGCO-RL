@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
-# See the LICENSE file in the project root for the full license text.
-
-# This file is derived from Stable-Baselines3 (SB3)
+# This file contains code derived from Stable-Baselines3 (SB3).
 # Original source: https://github.com/DLR-RM/stable-baselines3
-# Copyright (c) 2019 Antonin Raffin (SB3 Author)
-# Licensed under the MIT License
+# Original SB3 code is licensed under the MIT License.
+# Copyright (c) 2019 Antonin Raffin and other SB3 contributors.
+# The original SB3 portions retain their applicable MIT license.
 
 # Modification: Added StateActionQNetwork and StateActionDQNPolicy to implement a DQN variant that takes both state and action as input to the Q-network. This allows for more flexible action representations, such as continuous actions or action sets, rather than just discrete action indices, and support variable action sets.
 from typing import Union, Optional, Tuple, Dict

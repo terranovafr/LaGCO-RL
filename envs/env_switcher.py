@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
+
+'''
+    env_switcher.py
+    This module defines the GraphEnvSwitcher class, which is a Gym environment wrapper that allows switching between multiple graph-based environments during training, validation, and testing. It supports different switching strategies (random, random different, sequential) and can log environment switches and optionally save embeddings and step logs. It also handles padding of observation and action spaces if needed, and can compute PCA for continuous action spaces to reduce dimensionality while preserving variance.
+'''
 
 import gymnasium as gym
 import pickle

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Franco Terranova.
-# This file is licensed under the GNU General Public License v3.0.
-# You may redistribute it and/or modify it under the terms of the GPL-3.0.
+# This file is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# You may redistribute it and/or modify it under the terms of the AGPL-3.0.
 # See the LICENSE file in the project root for the full license text.
-
 '''
     padding_utils.py
     This module provides utility functions for padding Gym observations and spaces to ensure compatibility across different environments and agents. It includes functions to pad observations to match a target observation space, as well as functions to pad Gym spaces themselves. The utilities support various Gym space types, including Box, Discrete, MultiDiscrete, Tuple, and Dict.
