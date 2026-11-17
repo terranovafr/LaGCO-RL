@@ -90,8 +90,12 @@ def calculate_average_performances(model, gym_env, seeds, proto_knn, logger, num
         if not avoid_random:
             logger.info("Computing average performances of the random agent as well...")
 
-    for episode in tqdm(range(num_episodes), desc='Saving performances of each episode...'):
-        # determine which episode is with a certain environment and associate corresponding seed
+    for episode in tqdm(
+            range(num_episodes),
+            desc="Evaluating",
+            position=0,
+            leave=False
+    ):    # determine which episode is with a certain environment and associate corresponding seed
         set_seeds(seeds[episode // num_envs])
 
         # Play random actions to calculate random agent performance

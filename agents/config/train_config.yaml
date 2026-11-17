@@ -30,7 +30,7 @@ distance_temperature: 0
 epsilon_lower: -1
 epsilon_upper: 1
 index_type: flat
-knn: 10
+knn: 1
 
 # cache configuration
 cache_dir: cache
