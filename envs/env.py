@@ -25,7 +25,7 @@ class DiscreteEnv(gym.Env):
                  ):
         # set default values for all possible attributes
         self.verbose = kwargs.get("verbose", False)
-        self.max_steps_overall = kwargs.get("max_steps_overall", 100)
+        self.max_steps_overall = kwargs.get("max_steps_overall", 10)
         self.max_steps_coefficient = kwargs.get("max_steps_coefficient", 1.0)
         self.no_action_support = kwargs.get("no_action", False)
         self.no_action_penalty_sum = kwargs.get("no_action_penalty_sum", -10)
