@@ -31,68 +31,100 @@ class MaxCutEnv(DiscreteEnv):
 
     Agent assigns nodes to one of two partitions to maximize the total cut weight.
     """
-    def __init__(self,
-                 num_nodes=None,
-                 max_weight=None,
-                 graph=None,
-                 reward_type="relative",
-                 max_sweeps=1000,
-                 largest_K_edges=None,
-                 revisiting=False,
-                 **kwargs):
 
+    def __init__(
+            self,
+            num_nodes=None,
+            max_weight=None,
+            graph=None,
+            reward_type="relative",
+            max_sweeps=1000,
+            largest_K_edges=None,
+            revisiting=False,
+            **kwargs,
+    ):
         super().pre_init(**kwargs)
-        # If a NetworkX graph is supplied, infer its size and edge-weight range.
-        # Nodes are relabelled to contiguous integers because the environment's
-        # observation/action logic indexes nodes from 0 to num_nodes - 1.
+
         self.source_graph = None
+
         if graph is not None:
             if not isinstance(graph, nx.Graph) or isinstance(graph, nx.DiGraph):
                 raise TypeError("graph must be an undirected networkx.Graph")
+
             if graph.number_of_nodes() == 0:
                 raise ValueError("graph must contain at least one node")
+
             self.source_graph = graph.copy()
             self.original_node_labels = list(graph.nodes)
-            relabel = {label: i for i, label in enumerate(self.original_node_labels)}
+
+            relabel = {
+                label: i for i, label in enumerate(self.original_node_labels)
+            }
             graph = nx.relabel_nodes(graph, relabel, copy=True)
-            inferred_weights = [float(data.get("weight", data.get("edge_attr_dict", {}).get("weight", 1.0)))
-                                for _, _, data in graph.edges(data=True)]
-            if any(not np.isfinite(w) or w < 0 for w in inferred_weights):
+
+            edge_weights = [
+                float(
+                    data.get(
+                        "weight",
+                        data.get("edge_attr_dict", {}).get("weight", 1.0),
+                    )
+                )
+                for _, _, data in graph.edges(data=True)
+            ]
+
+            if any(not np.isfinite(w) or w < 0 for w in edge_weights):
                 raise ValueError("edge weights must be finite and non-negative")
+
             num_nodes = graph.number_of_nodes()
-            max_weight = max(inferred_weights, default=1.0) if max_weight is None else max_weight
+            max_weight = (
+                max(edge_weights, default=1.0)
+                if max_weight is None
+                else max_weight
+            )
             self._provided_graph = graph
+
         else:
             num_nodes = 10 if num_nodes is None else num_nodes
             max_weight = 10 if max_weight is None else max_weight
+
             self.original_node_labels = list(range(num_nodes))
             self._provided_graph = None
 
         self.num_nodes = int(num_nodes)
         self.max_weight = float(max_weight)
         self.reward_type = reward_type
-        self.largest_K_edges = largest_K_edges
         self.max_sweeps = max_sweeps
-        self.scenario_size = num_nodes
+        self.largest_K_edges = largest_K_edges
         self.revisiting = revisiting
-        # Observation: partition assignments + upper-triangular weights
-        obs_len = self.num_nodes + (self.num_nodes * (self.num_nodes - 1)) // 2
-        self.observation_space = spaces.Dict({
-            "graph": spaces.Box(low=0, high=self.max_weight, shape=(obs_len,), dtype=np.float32)
-        })
+        self.scenario_size = self.num_nodes
+
         self.current_cut = 0
         self.episode_history = []
+
         self._generate_graph()
-        actual_max_weight = float(np.max(self.weights_matrix)) if self.weights_matrix.size else 0.0
-        self.max_weight = max(self.max_weight, actual_max_weight)
+
+        # Ensure the observation space accommodates the generated weights.
+        self.max_weight = max(
+            self.max_weight,
+            float(np.max(self.weights_matrix, initial=0.0)),
+        )
+
+        # Observation: partition assignments + upper-triangular edge weights.
+        obs_len = self.num_nodes + self.num_nodes * (self.num_nodes - 1) // 2
+
         self.observation_space = spaces.Dict({
-            "graph": spaces.Box(low=0, high=self.max_weight,
-                                shape=(self.num_nodes + (self.num_nodes * (self.num_nodes - 1)) // 2,),
-                                dtype=np.float32)
+            "graph": spaces.Box(
+                low=0,
+                high=self.max_weight,
+                shape=(obs_len,),
+                dtype=np.float32,
+            )
         })
+
         self.best_cut, self.worst_cut = self.estimate_bounds(self.max_sweeps)
         self.semantic_action_list = self.build_semantic_action_list()
         self.action_list = self.build_action_list()
+
         super().post_init()
         self.reset()
 
@@ -370,8 +402,6 @@ class MaxCutEnv(DiscreteEnv):
             self.done |= (
                     self.current_cut >= self.best_cut
             )
-
-
 
         self.obs = self._get_obs()
         self._record_episode_step()
